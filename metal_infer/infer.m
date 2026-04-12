@@ -6189,6 +6189,15 @@ static void serve_loop(
             }
             body += 4;
 
+            // Extract stream flag (default true for SSE compatibility)
+            int do_stream = 1;
+            const char *stream_p = strstr(body, "\"stream\"");
+            if (stream_p) {
+                stream_p += 8;
+                while (*stream_p == ' ' || *stream_p == '\t' || *stream_p == ':') stream_p++;
+                if (strncmp(stream_p, "false", 5) == 0) do_stream = 0;
+            }
+
             // Extract session_id and max_tokens BEFORE content extraction
             // (extract_last_content mutates the body buffer in place)
             int max_gen = extract_max_tokens(body, 8192);
@@ -6300,8 +6309,10 @@ static void serve_loop(
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
-            // ---- Send SSE headers ----
-            http_write_str(client_fd, SSE_HEADERS);
+            // ---- Send SSE headers (streaming) or defer (non-streaming) ----
+            if (do_stream) {
+                http_write_str(client_fd, SSE_HEADERS);
+            }
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
@@ -6379,7 +6390,7 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
-            // Accumulate response for session persistence
+            // Accumulate response for session persistence and non-streaming mode
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
@@ -6414,16 +6425,18 @@ static void serve_loop(
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
-                // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                // Always accumulate (used for non-streaming response + session persistence)
+                if (tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+                if (do_stream) {
+                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                        fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                        break;
+                    }
                 }
                 gen_count++;
 
@@ -6452,7 +6465,47 @@ static void serve_loop(
                 next_token = cpu_argmax(logits, VOCAB_SIZE);
             }
 
-            sse_send_done(client_fd, request_id);
+            if (do_stream) {
+                sse_send_done(client_fd, request_id);
+            } else {
+                // Non-streaming: send complete JSON response
+                // JSON-escape the full response
+                size_t rlen = strlen(gen_response);
+                char *escaped = malloc(rlen * 2 + 1);
+                char *w = escaped;
+                for (const char *r = gen_response; *r; r++) {
+                    switch (*r) {
+                        case '"':  *w++ = '\\'; *w++ = '"';  break;
+                        case '\\': *w++ = '\\'; *w++ = '\\'; break;
+                        case '\n': *w++ = '\\'; *w++ = 'n';  break;
+                        case '\r': *w++ = '\\'; *w++ = 'r';  break;
+                        case '\t': *w++ = '\\'; *w++ = 't';  break;
+                        default:   *w++ = *r; break;
+                    }
+                }
+                *w = '\0';
+
+                char *json_body = malloc(strlen(escaped) + 512);
+                int json_len = sprintf(json_body,
+                    "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                    "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                    "\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+                    "\"usage\":{\"completion_tokens\":%d}}",
+                    request_id, escaped, gen_count);
+                free(escaped);
+
+                char hdr[256];
+                int hdr_len = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %d\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n"
+                    "\r\n", json_len);
+                http_write(client_fd, hdr, hdr_len);
+                http_write(client_fd, json_body, json_len);
+                free(json_body);
+            }
 
             // ---- Save session state ----
             free(gen_response);
