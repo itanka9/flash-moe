@@ -1,0 +1,65 @@
+Flash-MoE: Qwen3.5-122B-A10B Usage
+================================================================================
+Model: ~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit
+
+STEP 1 — Generate expert index
+================================================================================
+    cd /Users/dan/LLM/flash-moe
+    python generate_expert_index.py
+
+    Output: expert_index.json written into the model directory (~1MB, fast)
+
+STEP 2 — Extract non-expert weights
+================================================================================
+    cd /Users/dan/LLM/flash-moe/metal_infer
+    python extract_weights.py
+
+    Outputs: model_weights.bin (~4GB), model_weights.json
+
+STEP 3 — Export tokenizer and vocab
+================================================================================
+    cd /Users/dan/LLM/flash-moe/metal_infer
+    python export_tokenizer.py \
+        ~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/tokenizer.json \
+        tokenizer.bin
+    python export_vocab.py \
+        ~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/tokenizer.json \
+        vocab.bin
+
+    Outputs: tokenizer.bin (~20MB, BPE encoder), vocab.bin (~3MB, token id->string decoder)
+
+STEP 4 — Repack expert weights (4-bit)
+================================================================================
+    cd /Users/dan/LLM/flash-moe
+    python repack_experts.py --dry-run    # verify first
+    python repack_experts.py              # write ~65 GB to packed_experts/
+
+    Options:
+      --layers 0-4       repack only layers 0-4
+      --layers 0,5,10    repack specific layers
+      --verify-only 0    verify layer 0 against originals
+
+STEP 5 — Build
+================================================================================
+    cd /Users/dan/LLM/flash-moe/metal_infer
+    make clean && make
+
+STEP 6 — Inference
+================================================================================
+    # Single prompt
+    ./infer --prompt "Explain quantum computing" --tokens 100
+
+    # With per-layer timing
+    ./infer --prompt "Hello" --tokens 20 --timing
+
+    # More active experts (default K=4, max K=8 for 122B)
+    ./infer --prompt "Write a haiku" --tokens 50 --k 8
+
+    # 2-bit mode (faster, breaks tool calling / JSON)
+    ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
+
+    # Interactive chat with tool calling
+    ./chat
+
+    # Custom model path
+    ./infer --model /path/to/model --prompt "Hello" --tokens 50

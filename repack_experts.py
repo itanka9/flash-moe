@@ -2,8 +2,8 @@
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 512 experts x 7,077,888 bytes = ~3.63 GB
-Expert E starts at byte offset E * 7,077,888
+Each file = 256 experts x 5,308,416 bytes = ~1.36 GB
+Expert E starts at byte offset E * 5,308,416
 
 Within each expert block, 9 components packed in fixed order:
   gate_proj.weight, gate_proj.scales, gate_proj.biases,
@@ -11,7 +11,7 @@ Within each expert block, 9 components packed in fixed order:
   down_proj.weight,  down_proj.scales,  down_proj.biases
 
 Usage:
-    python repack_experts.py                    # repack all 60 layers
+    python repack_experts.py                    # repack all 48 layers
     python repack_experts.py --layers 0-4       # repack layers 0-4
     python repack_experts.py --layers 0,5,10    # repack specific layers
     python repack_experts.py --dry-run           # verify without writing
@@ -24,23 +24,23 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
+# Component order and expected sizes (122B: hidden=3072, moe_intermediate=1024, group_size=64)
 COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+    {"name": "gate_proj.weight",  "offset": 0,        "size": 1572864, "dtype": "U32",  "shape": [1024, 384]},
+    {"name": "gate_proj.scales",  "offset": 1572864,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
+    {"name": "gate_proj.biases",  "offset": 1671168,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
+    {"name": "up_proj.weight",    "offset": 1769472,  "size": 1572864, "dtype": "U32",  "shape": [1024, 384]},
+    {"name": "up_proj.scales",    "offset": 3342336,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
+    {"name": "up_proj.biases",    "offset": 3440640,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
+    {"name": "down_proj.weight",  "offset": 3538944,  "size": 1572864, "dtype": "U32",  "shape": [3072, 128]},
+    {"name": "down_proj.scales",  "offset": 5111808,  "size": 98304,   "dtype": "BF16", "shape": [3072, 16]},
+    {"name": "down_proj.biases",  "offset": 5210112,  "size": 98304,   "dtype": "BF16", "shape": [3072, 16]},
 ]
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+EXPERT_SIZE = 5308416   # bytes per expert
+NUM_EXPERTS = 256
+NUM_LAYERS = 48
+LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 1,358,954,496 bytes (~1.36 GB)
 
 
 def parse_layers(spec):
@@ -101,7 +101,7 @@ def open_source_files(expert_reads, model_path, layers):
 
 
 def repack_layer(layer_idx, expert_reads, model_path, fds, output_dir, dry_run=False):
-    """Repack all 512 experts for one layer into a contiguous binary file.
+    """Repack all 256 experts for one layer into a contiguous binary file.
 
     Returns (bytes_written, elapsed_seconds).
     """
@@ -173,7 +173,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     fd_packed = os.open(out_path, os.O_RDONLY)
 
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
+    for expert_idx in [0, 1, NUM_EXPERTS - 1]:  # spot check first, second, last expert
         for comp in COMPONENTS:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
@@ -190,7 +190,7 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     os.close(fd_packed)
 
     if mismatches == 0:
-        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, 255, 511)")
+        print(f"  Layer {layer_idx}: verification PASSED (experts 0, 1, {NUM_EXPERTS - 1})")
     else:
         print(f"  Layer {layer_idx}: verification FAILED ({mismatches} mismatches)")
 
@@ -213,7 +213,7 @@ def write_layout(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', default='/Users/danielwoods/Workspace/ane-research/expert_index.json',
+    parser.add_argument('--index', default=os.path.expanduser('~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/expert_index.json'),
                         help='Path to expert_index.json')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')

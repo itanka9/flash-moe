@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-extract_weights.py — Extract all non-expert weights from Qwen3.5-397B-A17B-4bit
+extract_weights.py — Extract all non-expert weights from Qwen3.5-122B-A10B-4bit
 into a single binary file that the C inference engine can mmap.
 
 Outputs:
@@ -41,8 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
     parser.add_argument('--model', type=str,
                         default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
-                            '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
+                            '~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit'),
                         help='Path to model directory')
     parser.add_argument('--output', type=str, default='.',
                         help='Output directory for model_weights.bin and .json')
@@ -123,15 +122,15 @@ def main():
         "tensors": {},
         # Model config for the C engine
         "config": {
-            "hidden_size": 4096,
-            "num_hidden_layers": 60,
+            "hidden_size": 3072,
+            "num_hidden_layers": 48,
             "num_attention_heads": 32,
             "num_key_value_heads": 2,
             "head_dim": 256,
             "vocab_size": 248320,
             "rms_norm_eps": 1e-6,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
             "moe_intermediate_size": 1024,
             "shared_expert_intermediate_size": 1024,
             "full_attention_interval": 4,
@@ -147,7 +146,7 @@ def main():
 
     # Layer type map
     layer_types = []
-    for i in range(60):
+    for i in range(48):
         if (i + 1) % 4 == 0:
             layer_types.append("full_attention")
         else:
