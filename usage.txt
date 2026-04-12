@@ -39,6 +39,21 @@ STEP 4 — Repack expert weights (4-bit)
       --layers 0,5,10    repack specific layers
       --verify-only 0    verify layer 0 against originals
 
+STEP 4b — Repack expert weights to 2-bit (optional, faster but lower quality)
+================================================================================
+    cd /Users/dan/LLM/flash-moe
+
+    # Test a single layer first (with verification)
+    python metal_infer/repack_experts_2bit.py --layer 0 --verify
+
+    # Repack all 48 layers (~32 GB output, vs ~65 GB for 4-bit)
+    python metal_infer/repack_experts_2bit.py
+
+    Output: packed_experts_2bit/layer_XX.bin (2,949,120 bytes per expert × 256 experts)
+
+    Note: 2-bit mode is faster but breaks JSON/tool calling (produces \name\ instead of
+    "name"). Use 4-bit for production; 2-bit for speed experiments only.
+
 STEP 5 — Build
 ================================================================================
     cd /Users/dan/LLM/flash-moe/metal_infer
@@ -55,7 +70,7 @@ STEP 6 — Inference
     # More active experts (default K=4, max K=8 for 122B)
     ./infer --prompt "Write a haiku" --tokens 50 --k 8
 
-    # 2-bit mode (faster, breaks tool calling / JSON)
+    # 2-bit mode (faster, breaks tool calling / JSON — requires Step 4b)
     ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
 
     # Interactive chat with tool calling
