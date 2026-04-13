@@ -195,6 +195,7 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static float g_temperature = 0.0f; // 0 = greedy (argmax), >0 = temperature sampling
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -850,6 +851,41 @@ static int cpu_argmax(const float *x, int dim) {
         }
     }
     return best;
+}
+
+// Temperature sampling: apply softmax with temperature, then sample via CDF.
+// Falls back to argmax if temperature <= 0.
+static int cpu_sample(const float *logits, int dim, float temperature) {
+    if (temperature <= 0.0f) return cpu_argmax(logits, dim);
+
+    // Find max for numerical stability
+    float max_val = logits[0];
+    for (int i = 1; i < dim; i++) if (logits[i] > max_val) max_val = logits[i];
+
+    // Compute softmax with temperature
+    float *probs = malloc((size_t)dim * sizeof(float));
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        probs[i] = expf((logits[i] - max_val) / temperature);
+        sum += probs[i];
+    }
+    for (int i = 0; i < dim; i++) probs[i] /= sum;
+
+    // Sample from CDF
+    float r = (float)rand() / ((float)RAND_MAX + 1.0f);
+    float cdf = 0.0f;
+    int result = dim - 1;
+    for (int i = 0; i < dim; i++) {
+        cdf += probs[i];
+        if (r < cdf) { result = i; break; }
+    }
+    free(probs);
+    return result;
+}
+
+// Sample next token using current global temperature setting
+static inline int sample_next_token(const float *logits, int dim) {
+    return cpu_sample(logits, dim, g_temperature);
 }
 
 // SiLU activation
@@ -5731,6 +5767,235 @@ static int extract_max_tokens(const char *buf, int default_val) {
     return atoi(p + 1);
 }
 
+// Extract the raw JSON of the "tools" array from the request body (non-mutating).
+// Sets *out_start to the '[' of the array, *out_len to its byte length.
+// Returns 1 if found and non-empty, 0 otherwise.
+static int extract_tools_json(const char *buf, const char **out_start, int *out_len) {
+    const char *p = strstr(buf, "\"tools\"");
+    if (!p) return 0;
+    p += 7;
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p != '[') return 0;
+    const char *start = p;
+    int depth = 0, in_str = 0;
+    while (*p) {
+        if (in_str) {
+            if (*p == '\\') { p++; if (*p) p++; continue; }
+            if (*p == '"') in_str = 0;
+        } else {
+            if (*p == '"') in_str = 1;
+            else if (*p == '[' || *p == '{') depth++;
+            else if (*p == ']' || *p == '}') { if (--depth == 0) { p++; break; } }
+        }
+        p++;
+    }
+    *out_start = start;
+    *out_len = (int)(p - start);
+    return (*out_len > 2);
+}
+
+// Split gen_response into reasoning_content and content by extracting <think>...</think>.
+// Both out_reasoning and out_content are malloc'd; caller frees.
+// If no <think> block: out_reasoning = "" (empty malloc), out_content = full text.
+static void extract_think_and_content(const char *gen_response,
+                                       char **out_reasoning, char **out_content) {
+    const char *think_start = strstr(gen_response, "<think>");
+    const char *think_end   = think_start ? strstr(think_start, "</think>") : NULL;
+
+    if (think_start && think_end) {
+        // reasoning = text between <think> and </think>
+        const char *r_start = think_start + 7;  // skip "<think>"
+        int r_len = (int)(think_end - r_start);
+        if (r_len < 0) r_len = 0;
+        *out_reasoning = malloc(r_len + 1);
+        memcpy(*out_reasoning, r_start, r_len);
+        (*out_reasoning)[r_len] = '\0';
+
+        // content = text after </think> (skip leading newline if present)
+        const char *c_start = think_end + 8;  // skip "</think>"
+        while (*c_start == '\n' || *c_start == '\r') c_start++;
+        // Stop at tool call markers
+        const char *c_end = strstr(c_start, "<tool_call>");
+        const char *c_end2 = strstr(c_start, "{\"tool\":");
+        if (!c_end || (c_end2 && c_end2 < c_end)) c_end = c_end2;
+        if (!c_end) c_end = c_start + strlen(c_start);
+        int c_len = (int)(c_end - c_start);
+        // Trim trailing whitespace
+        while (c_len > 0 && (c_start[c_len-1] == ' '  ||
+                              c_start[c_len-1] == '\n' ||
+                              c_start[c_len-1] == '\r')) c_len--;
+        *out_content = malloc(c_len + 1);
+        memcpy(*out_content, c_start, c_len);
+        (*out_content)[c_len] = '\0';
+    } else {
+        *out_reasoning = strdup("");
+        // content = full text up to tool call markers
+        const char *c_end = strstr(gen_response, "<tool_call>");
+        const char *c_end2 = strstr(gen_response, "{\"tool\":");
+        if (!c_end || (c_end2 && c_end2 < c_end)) c_end = c_end2;
+        if (!c_end) c_end = gen_response + strlen(gen_response);
+        int c_len = (int)(c_end - gen_response);
+        while (c_len > 0 && (gen_response[c_len-1] == ' '  ||
+                              gen_response[c_len-1] == '\n' ||
+                              gen_response[c_len-1] == '\r')) c_len--;
+        *out_content = malloc(c_len + 1);
+        memcpy(*out_content, gen_response, c_len);
+        (*out_content)[c_len] = '\0';
+    }
+}
+
+// Parse a tool call from generated model output.
+// Handles three formats:
+//   Format 1: <tool_call>{"name":"...","arguments":{...}}</tool_call>
+//   Format 2: <tool_call><function=NAME>...</function></tool_call>
+//   Format 3: {"tool":"...","arguments":{...}}  (flat JSON, new Chinese prompt format)
+// *pre_len: length of content BEFORE the tool call marker
+// name_out: buffer for function name (null-terminated)
+// *arguments_out: malloc'd raw JSON string for arguments — caller must free()
+// Returns 1 if found and parsed, 0 otherwise.
+// Extract a JSON object starting at *p, bounded by end. Advances *p past the object.
+// Returns malloc'd copy or NULL. Caller frees.
+static char *extract_json_object(const char **p, const char *end) {
+    if (**p != '{') return NULL;
+    const char *start = *p;
+    int depth = 0, in_str = 0;
+    while (*p < end) {
+        char c = **p;
+        if (in_str) {
+            if (c == '\\') { (*p)++; }  // skip escaped char
+            else if (c == '"') in_str = 0;
+        } else {
+            if (c == '"') in_str = 1;
+            else if (c == '{') depth++;
+            else if (c == '}') { if (--depth == 0) { (*p)++; break; } }
+        }
+        (*p)++;
+    }
+    int len = (int)(*p - start);
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+// Extract a JSON string value after a key. p points just after the ':'.
+// Returns malloc'd unescaped string or NULL. Caller frees.
+static char *extract_json_string(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n')) p++;
+    if (*p != '"') return NULL;
+    p++;
+    char *buf = malloc((size_t)(end - p) + 1);
+    if (!buf) return NULL;
+    int i = 0;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            switch (*p) {
+                case '"':  buf[i++] = '"';  break;
+                case '\\': buf[i++] = '\\'; break;
+                case 'n':  buf[i++] = '\n'; break;
+                case 'r':  buf[i++] = '\r'; break;
+                case 't':  buf[i++] = '\t'; break;
+                default:   buf[i++] = '\\'; buf[i++] = *p; break;
+            }
+        } else {
+            buf[i++] = *p;
+        }
+        p++;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+static int parse_tool_call(const char *gen_response, int *pre_len,
+                            char *name_out, int name_max,
+                            char **arguments_out, int *arguments_len_out) {
+    const char *end = gen_response + strlen(gen_response);
+
+    // ---- Format 1: {"tool": "name", "arguments": {...}} ----
+    // New Chinese prompt format — flat JSON object, no wrapper tags.
+    const char *flat = strstr(gen_response, "\"tool\"");
+    if (flat) {
+        // Walk back to the opening '{' of the object
+        const char *obj_start = flat;
+        while (obj_start > gen_response && *obj_start != '{') obj_start--;
+        if (*obj_start == '{') {
+            const char *p = obj_start;
+            char *obj = extract_json_object(&p, end);
+            if (obj) {
+                // Extract "tool" name
+                const char *tp = strstr(obj, "\"tool\"");
+                char *name = NULL;
+                if (tp) {
+                    tp += 6;
+                    while (*tp == ' ' || *tp == ':') tp++;
+                    name = extract_json_string(tp, obj + strlen(obj));
+                }
+                // Extract "arguments" object
+                const char *ap = strstr(obj, "\"arguments\"");
+                char *args = NULL;
+                if (ap) {
+                    ap += 11;
+                    while (*ap == ' ' || *ap == ':') ap++;
+                    const char *ap2 = ap;
+                    args = extract_json_object(&ap2, obj + strlen(obj));
+                }
+                if (name && name[0]) {
+                    int nl = (int)strlen(name);
+                    if (nl >= name_max) nl = name_max - 1;
+                    memcpy(name_out, name, nl);
+                    name_out[nl] = '\0';
+                    *pre_len = (int)(obj_start - gen_response);
+                    *arguments_out = args ? args : strdup("{}");
+                    *arguments_len_out = (int)strlen(*arguments_out);
+                    free(name); free(obj);
+                    return 1;
+                }
+                free(name); free(args); free(obj);
+            }
+        }
+    }
+
+    // ---- Format 2: <tool_call>{"name":"...","arguments":{...}}</tool_call> ----
+    const char *tag_start = strstr(gen_response, "<tool_call>");
+    if (!tag_start) return 0;
+    const char *tag_end = strstr(tag_start, "</tool_call>");
+    if (!tag_end) tag_end = end;
+
+    *pre_len = (int)(tag_start - gen_response);
+
+    const char *body = tag_start + 11;
+    while (*body == ' ' || *body == '\n' || *body == '\r' || *body == '\t' ||
+           *body == '`') body++;  // skip optional ```json fence
+    if (*body != '{') return 0;
+
+    const char *bp = body;
+    char *obj = extract_json_object(&bp, tag_end);
+    if (!obj) return 0;
+
+    // Accept both "tool" and "name" keys for the function name
+    const char *np = strstr(obj, "\"tool\"");
+    if (!np) np = strstr(obj, "\"name\"");
+    char *name = NULL;
+    if (np) { np += (strncmp(np, "\"tool\"", 6) == 0 ? 6 : 6); while (*np == ' ' || *np == ':') np++; name = extract_json_string(np, obj + strlen(obj)); }
+    const char *ap = strstr(obj, "\"arguments\"");
+    char *args = NULL;
+    if (ap) { ap += 11; while (*ap == ' ' || *ap == ':') ap++; const char *ap2 = ap; args = extract_json_object(&ap2, obj + strlen(obj)); }
+
+    free(obj);
+    if (!name || !name[0]) { free(name); free(args); return 0; }
+
+    int nl = (int)strlen(name);
+    if (nl >= name_max) nl = name_max - 1;
+    memcpy(name_out, name, nl);
+    name_out[nl] = '\0';
+    *arguments_out = args ? args : strdup("{}");
+    *arguments_len_out = (int)strlen(*arguments_out);
+    free(name);
+    return 1;
+}
+
 // Save a conversation turn to ~/.flash-moe/sessions/<session_id>.jsonl
 // Shared data store with the chat client.
 static void server_save_turn(const char *session_id, const char *role, const char *content) {
@@ -5834,6 +6099,27 @@ static void sse_send_done(int fd, const char *request_id) {
     http_write(fd, chunk, n);
 }
 
+// Send a structured tool_calls SSE event and [DONE] (streaming mode).
+// esc_args: already JSON-string-escaped arguments (e.g. "{\"location\":\"杭州\"}")
+static void sse_send_tool_call_done(int fd, const char *request_id,
+                                     const char *call_id,
+                                     const char *fn_name,
+                                     const char *esc_args) {
+    size_t buf_size = strlen(fn_name) + strlen(esc_args) + strlen(call_id) + 512;
+    char *chunk = malloc(buf_size);
+    if (!chunk) return;
+    int n = snprintf(chunk, buf_size,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{"
+        "\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\",\"index\":0,"
+        "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n",
+        request_id, call_id, fn_name, esc_args);
+    http_write(fd, chunk, n);
+    free(chunk);
+}
+
 static const char *SSE_HEADERS =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/event-stream\r\n"
@@ -5883,6 +6169,175 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     return pt;
 }
 
+// Build a compact tools description string from the OpenAI tools JSON array.
+// Extracts name + description for each tool and formats as a readable list.
+// Returns a malloc'd string; caller frees. Falls back to raw JSON on parse error.
+// Extract a simple JSON string value for a key within [start, end).
+// Returns malloc'd string or NULL. Caller frees.
+static char *json_get_string(const char *key, const char *start, const char *end) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(start, search);
+    if (!p || p >= end) return NULL;
+    p += strlen(search);
+    while (p < end && (*p == ' ' || *p == ':')) p++;
+    if (p >= end || *p != '"') return NULL;
+    return extract_json_string(p, end);
+}
+
+// Build tool description string for system prompt: name, description, and parameters.
+// Format per tool:
+//   工具名: get_weather
+//   描述: 获取指定城市的天气信息
+//   参数:
+//     - location (string, 必填): 城市名称，例如：北京、上海
+// Returns malloc'd string; caller frees.
+static char *build_tools_description(const char *tools_json, int tools_len) {
+    char *out = malloc((size_t)tools_len * 4 + 1024);
+    if (!out) return NULL;
+    char *wp = out;
+    const char *p = tools_json;
+    const char *end = tools_json + tools_len;
+    int first = 1;
+
+    while (p < end) {
+        // Find "function": { ... }
+        const char *fn_key = strstr(p, "\"function\"");
+        if (!fn_key || fn_key >= end) break;
+        const char *fn_obj_start = fn_key + 10;
+        while (*fn_obj_start == ' ' || *fn_obj_start == ':') fn_obj_start++;
+        if (*fn_obj_start != '{') { p = fn_key + 10; continue; }
+
+        // Walk to end of this function object
+        const char *fn_p = fn_obj_start;
+        char *fn_obj = extract_json_object(&fn_p, end);
+        if (!fn_obj) { p = fn_obj_start + 1; continue; }
+        const char *fo_end = fn_obj + strlen(fn_obj);
+
+        char *name = json_get_string("name", fn_obj, fo_end);
+        char *desc = json_get_string("description", fn_obj, fo_end);
+
+        if (!first) wp += sprintf(wp, "\n");
+        first = 0;
+
+        wp += sprintf(wp, "工具名: %s\n描述: %s\n参数:\n",
+                      name ? name : "(unknown)", desc ? desc : "");
+
+        // Parse parameters.properties
+        const char *params_key = strstr(fn_obj, "\"parameters\"");
+        if (params_key) {
+            params_key += 12;
+            while (*params_key == ' ' || *params_key == ':') params_key++;
+            if (*params_key == '{') {
+                const char *params_p = params_key;
+                char *params_obj = extract_json_object(&params_p, fo_end);
+                if (params_obj) {
+                    // Extract required array
+                    char required_buf[1024] = {0};
+                    const char *req_p = strstr(params_obj, "\"required\"");
+                    if (req_p) {
+                        req_p += 10;
+                        while (*req_p == ' ' || *req_p == ':') req_p++;
+                        if (*req_p == '[') {
+                            req_p++;
+                            int ri = 0;
+                            while (*req_p && *req_p != ']' && ri < 1020) {
+                                required_buf[ri++] = *req_p++;
+                            }
+                            required_buf[ri] = '\0';
+                        }
+                    }
+
+                    // Find properties object
+                    const char *props_p = strstr(params_obj, "\"properties\"");
+                    if (props_p) {
+                        props_p += 12;
+                        while (*props_p == ' ' || *props_p == ':') props_p++;
+                        if (*props_p == '{') {
+                            const char *pp = props_p + 1;  // skip '{'
+                            // Iterate over each property key: "propname": {...}
+                            while (*pp && *pp != '}') {
+                                while (*pp == ' ' || *pp == '\n' || *pp == '\r' || *pp == ',') pp++;
+                                if (*pp != '"') break;
+                                // Extract property name
+                                pp++;
+                                char prop_name[128] = {0};
+                                int pni = 0;
+                                while (*pp && *pp != '"' && pni < 127) prop_name[pni++] = *pp++;
+                                prop_name[pni] = '\0';
+                                if (*pp == '"') pp++;
+                                while (*pp == ' ' || *pp == ':') pp++;
+                                if (*pp != '{') break;
+
+                                // Extract the property object
+                                const char *prop_p = pp;
+                                char *prop_obj = extract_json_object(&prop_p, params_obj + strlen(params_obj));
+                                if (!prop_obj) break;
+
+                                char *ptype = json_get_string("type", prop_obj, prop_obj + strlen(prop_obj));
+                                char *pdesc = json_get_string("description", prop_obj, prop_obj + strlen(prop_obj));
+
+                                // Check if required
+                                char search_req[130];
+                                snprintf(search_req, sizeof(search_req), "\"%s\"", prop_name);
+                                int is_req = strstr(required_buf, search_req) != NULL;
+
+                                wp += sprintf(wp, "  - %s (%s%s): %s\n",
+                                              prop_name,
+                                              ptype ? ptype : "any",
+                                              is_req ? ", 必填" : "",
+                                              pdesc ? pdesc : "");
+
+                                free(ptype); free(pdesc); free(prop_obj);
+                                pp = prop_p;
+                            }
+                        }
+                    }
+                    free(params_obj);
+                }
+            }
+        }
+
+        free(name); free(desc); free(fn_obj);
+        p = fn_p;
+    }
+    *wp = '\0';
+
+    // Fall back to raw JSON if nothing was extracted
+    if (wp == out) {
+        memcpy(out, tools_json, (size_t)tools_len);
+        out[tools_len] = '\0';
+    }
+    return out;
+}
+
+// Build a malloc'd system prompt string with Chinese tool instructions appended.
+// Caller must free() the result.
+static char *build_system_prompt_with_tools(const char *base_sys,
+                                             const char *tools_json, int tools_len) {
+    char *tools_desc = build_tools_description(tools_json, tools_len);
+    if (!tools_desc) return NULL;
+
+    // Chinese tool prompt: clear format, no XML, just JSON output
+    static const char *PREFIX =
+        "\n\n你是一个可以调用外部工具的助手。当需要获取实时信息或执行特定操作时，"
+        "请输出一个 JSON 对象表示要调用的工具。\n"
+        "可用的工具如下：\n";
+    static const char *SUFFIX =
+        "\n输出格式必须严格为：{\"tool\": \"工具名称\", \"arguments\": {参数对象}}。\n"
+        "**重要提示：请判断用户的问题，是否需要调用工具，如果需要调用工具，"
+        "聪明的选择对应的工具，并使用以上格式输出。**\n"
+        "如果不需要调用工具，请直接给出普通回答。";
+
+    size_t total = strlen(base_sys) + strlen(PREFIX) + strlen(tools_desc) + strlen(SUFFIX) + 4;
+    char *buf = malloc(total);
+    if (!buf) { free(tools_desc); return NULL; }
+    snprintf(buf, total, "%s%s%s%s", base_sys, PREFIX, tools_desc, SUFFIX);
+    free(tools_desc);
+    fprintf(stderr, "[serve] System prompt with tools (%zu bytes):\n%s\n", strlen(buf), buf);
+    return buf;
+}
+
 // Load custom system prompt from ~/.flash-moe/system.md, or use default
 static char *load_system_prompt(void) {
     const char *home = getenv("HOME");
@@ -5903,6 +6358,23 @@ static char *load_system_prompt(void) {
         }
     }
     return strdup("You are a helpful assistant. /think");
+}
+
+// Tokenize a full chat message using an explicit system prompt (for tool requests).
+// sys_with_tools: caller-owned string including tool definitions; not freed here.
+static PromptTokens *tokenize_chat_message_with_tools(const char *user_content,
+                                                       const char *sys_with_tools) {
+    size_t total = 30 + strlen(sys_with_tools) + 30 + strlen(user_content) + 40;
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total,
+        "<|im_start|>system\n%s<|im_end|>\n"
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        sys_with_tools, user_content);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -6198,12 +6670,38 @@ static void serve_loop(
                 if (strncmp(stream_p, "false", 5) == 0) do_stream = 0;
             }
 
-            // Extract session_id and max_tokens BEFORE content extraction
-            // (extract_last_content mutates the body buffer in place)
+            // Extract session_id, max_tokens, and tools BEFORE content extraction
+            // (extract_last_content mutates the body buffer in place — must be last)
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
+            // Per-request temperature (overrides global --temp if present)
+            float req_temperature = g_temperature;
+            {
+                const char *tp = strstr(body, "\"temperature\"");
+                if (tp) {
+                    tp = strchr(tp, ':');
+                    if (tp) req_temperature = strtof(tp + 1, NULL);
+                }
+            }
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
+
+            // Extract tools array (pointer into body — non-mutating)
+            const char *tools_json_start = NULL;
+            int tools_json_len = 0;
+            int has_tools = extract_tools_json(body, &tools_json_start, &tools_json_len);
+            // Respect tool_choice: "none"
+            {
+                const char *tc_p = strstr(body, "\"tool_choice\"");
+                if (tc_p) {
+                    tc_p = strchr(tc_p, ':');
+                    if (tc_p) {
+                        while (*tc_p == ':' || *tc_p == ' ' || *tc_p == '\t') tc_p++;
+                        if (strncmp(tc_p, "\"none\"", 6) == 0) has_tools = 0;
+                    }
+                }
+            }
+            char *tools_sys_prompt = NULL;  // malloc'd per-request; freed after response
 
             // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
@@ -6222,17 +6720,32 @@ static void serve_loop(
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen,
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, has_tools=%d, session=%s%s\n",
+                    request_id, strlen(content), max_gen, has_tools,
                     has_session ? req_session_id : "(none)",
                     is_continuation ? " [CONTINUE]" : " [NEW]");
+            fprintf(stderr, "[serve] %s request body: %.500s\n", request_id, body);
 
             // ---- Tokenize ----
+            // Tool requests: full cold prefill with system+tools+user from pos=0
             // Continuation: prefix with <|im_end|>\n to close prior assistant turn
             // New session: just the user turn (system prompt restored from snapshot)
+            int do_full_prefill = has_tools;
             PromptTokens *pt;
-            if (is_continuation) {
+            if (is_continuation && !do_full_prefill) {
                 pt = tokenize_continuation_turn(content);
+            } else if (do_full_prefill) {
+                static char *g_base_sys = NULL;
+                if (!g_base_sys) g_base_sys = load_system_prompt();
+                tools_sys_prompt = build_system_prompt_with_tools(
+                    g_base_sys, tools_json_start, tools_json_len);
+                if (!tools_sys_prompt) {
+                    http_write_str(client_fd,
+                        "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                        "{\"error\":\"failed to build tool system prompt\"}\n");
+                    free(reqbuf); close(client_fd); continue;
+                }
+                pt = tokenize_chat_message_with_tools(content, tools_sys_prompt);
             } else {
                 pt = tokenize_user_turn(content);
             }
@@ -6240,18 +6753,47 @@ static void serve_loop(
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
+                if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
-                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
+            fprintf(stderr, "[serve] %s prompt=%d tokens%s%s\n", request_id, pt->count,
+                    is_continuation ? " (continuation)" : "",
+                    do_full_prefill ? " (full-prefill, tools)" : "");
 
             int pos;
-            if (is_continuation) {
+            if (is_continuation && !do_full_prefill) {
                 // ---- Continue from existing session state ----
                 // The KV caches + linear attention state already contain the full
                 // conversation history. Just set pos to where we left off.
                 pos = session_pos;
+            } else if (do_full_prefill) {
+                // ---- Full cold reset for tool requests ----
+                // The system prompt differs (includes tool definitions), so the
+                // cached snapshot is invalid. Reset everything to zero and prefill
+                // from pos=0 with the full system+tools+user prompt.
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (kv_caches[i]) kv_caches[i]->len = 0;
+                    if (layer_states[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memset(s->conv_state, 0, conv_state_size);
+                        memset(s->ssm_state, 0, ssm_state_size);
+                    }
+                }
+                if (g_metal && g_metal->delta_net_step) {
+                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+                        if (g_metal->buf_delta_state[i])
+                            memset([g_metal->buf_delta_state[i] contents], 0,
+                                   64*128*128*sizeof(float));
+                        if (g_metal->buf_conv_state[i])
+                            memset([g_metal->buf_conv_state[i] contents], 0,
+                                   3*12288*sizeof(float));
+                    }
+                } else {
+                    reset_delta_net_state();
+                }
+                pos = 0;
+                active_session_id[0] = '\0';  // tool requests are stateless
             } else {
                 // ---- Restore state from system prompt snapshot ----
                 // Instead of resetting to zero, restore to the cached system prompt state.
@@ -6308,6 +6850,8 @@ static void serve_loop(
                 }
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
+            float saved_temperature = g_temperature;
+            g_temperature = req_temperature;
 
             // ---- Send SSE headers (streaming) or defer (non-streaming) ----
             if (do_stream) {
@@ -6379,7 +6923,7 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            int next_token = cpu_argmax(logits, VOCAB_SIZE);
+            int next_token = sample_next_token(logits, VOCAB_SIZE);
 
             // ---- Auto-regressive generation with SSE streaming ----
             if (g_pred_enabled) {
@@ -6390,6 +6934,7 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
+            int tool_call_started = 0;  // set once <tool_call> appears; suppresses SSE stream
             // Accumulate response for session persistence and non-streaming mode
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
@@ -6433,9 +6978,26 @@ static void serve_loop(
                     gen_response[gen_resp_len] = 0;
                 }
                 if (do_stream) {
-                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                        fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                        break;
+                    if (has_tools) {
+                        if (!tool_call_started) {
+                            // Detect start of tool call block in accumulated output
+                            if (strstr(gen_response, "<tool_call>") ||
+                                strstr(gen_response, "\"tool\"")) {
+                                tool_call_started = 1;
+                                // Suppress this and all subsequent tokens
+                            } else {
+                                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                                    fprintf(stderr, "[serve] %s client disconnected\n", request_id);
+                                    break;
+                                }
+                            }
+                        }
+                        // Once tool_call_started: accumulate silently, emit structured event later
+                    } else {
+                        if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                            fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                            break;
+                        }
                     }
                 }
                 gen_count++;
@@ -6462,52 +7024,164 @@ static void serve_loop(
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
-                next_token = cpu_argmax(logits, VOCAB_SIZE);
+                next_token = sample_next_token(logits, VOCAB_SIZE);
             }
 
+            // ---- JSON-escape helper (used by both streaming and non-streaming paths) ----
+            // Returns malloc'd string; caller frees.
+            #define JSON_ESCAPE(src, srclen, dst, dstlen_out) do { \
+                size_t _sl = (srclen) > 0 ? (srclen) : strlen(src); \
+                (dst) = malloc(_sl * 2 + 1); \
+                char *_w = (dst); \
+                for (size_t _i = 0; _i < _sl; _i++) { \
+                    char _c = (src)[_i]; \
+                    switch (_c) { \
+                        case '"':  *_w++='\\'; *_w++='"';  break; \
+                        case '\\': *_w++='\\'; *_w++='\\'; break; \
+                        case '\n': *_w++='\\'; *_w++='n';  break; \
+                        case '\r': *_w++='\\'; *_w++='r';  break; \
+                        case '\t': *_w++='\\'; *_w++='t';  break; \
+                        default:   *_w++=_c; break; \
+                    } \
+                } \
+                *_w = '\0'; \
+                (dstlen_out) = (int)(_w - (dst)); \
+            } while(0)
+
             if (do_stream) {
-                sse_send_done(client_fd, request_id);
-            } else {
-                // Non-streaming: send complete JSON response
-                // JSON-escape the full response
-                size_t rlen = strlen(gen_response);
-                char *escaped = malloc(rlen * 2 + 1);
-                char *w = escaped;
-                for (const char *r = gen_response; *r; r++) {
-                    switch (*r) {
-                        case '"':  *w++ = '\\'; *w++ = '"';  break;
-                        case '\\': *w++ = '\\'; *w++ = '\\'; break;
-                        case '\n': *w++ = '\\'; *w++ = 'n';  break;
-                        case '\r': *w++ = '\\'; *w++ = 'r';  break;
-                        case '\t': *w++ = '\\'; *w++ = 't';  break;
-                        default:   *w++ = *r; break;
+                if (has_tools && tool_call_started) {
+                    // Parse tool call from accumulated output and emit structured SSE event
+                    int pre_len = 0;
+                    char tc_name[256] = {0};
+                    char *tc_args = NULL;
+                    int tc_args_len = 0;
+                    if (parse_tool_call(gen_response, &pre_len,
+                                        tc_name, sizeof(tc_name),
+                                        &tc_args, &tc_args_len)) {
+                        char call_id[32];
+                        snprintf(call_id, sizeof(call_id), "call_%04llu", req_counter);
+                        char *esc_args = NULL; int esc_args_len = 0;
+                        JSON_ESCAPE(tc_args, tc_args_len, esc_args, esc_args_len);
+                        char *esc_name = NULL; int esc_name_len = 0;
+                        JSON_ESCAPE(tc_name, 0, esc_name, esc_name_len);
+                        (void)esc_args_len; (void)esc_name_len;
+                        sse_send_tool_call_done(client_fd, request_id,
+                                                call_id, esc_name, esc_args);
+                        free(esc_args);
+                        free(esc_name);
+                        free(tc_args);
+                    } else {
+                        sse_send_done(client_fd, request_id);
                     }
+                } else {
+                    sse_send_done(client_fd, request_id);
                 }
-                *w = '\0';
+            } else {
+                // Non-streaming: detect tool call and format response accordingly
+                fprintf(stderr, "[serve] %s gen_response (%d chars): %.500s\n",
+                        request_id, gen_resp_len, gen_response);
+                int pre_len = 0;
+                char tc_name[256] = {0};
+                char *tc_args = NULL;
+                int tc_args_len = 0;
+                int found_tc = has_tools && parse_tool_call(gen_response, &pre_len,
+                                                             tc_name, sizeof(tc_name),
+                                                             &tc_args, &tc_args_len);
+                fprintf(stderr, "[serve] %s found_tc=%d tc_name='%s' tc_args=%s\n",
+                        request_id, found_tc, tc_name, tc_args ? tc_args : "(null)");
+                if (found_tc) {
+                    // Split gen_response into reasoning_content + content
+                    char *reasoning = NULL, *visible_content = NULL;
+                    extract_think_and_content(gen_response, &reasoning, &visible_content);
 
-                char *json_body = malloc(strlen(escaped) + 512);
-                int json_len = sprintf(json_body,
-                    "{\"id\":\"%s\",\"object\":\"chat.completion\","
-                    "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                    "\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
-                    "\"usage\":{\"completion_tokens\":%d}}",
-                    request_id, escaped, gen_count);
-                free(escaped);
+                    char *esc_content = NULL; int esc_content_len = 0;
+                    JSON_ESCAPE(visible_content, 0, esc_content, esc_content_len);
+                    char *esc_reasoning = NULL; int esc_reasoning_len = 0;
+                    JSON_ESCAPE(reasoning, 0, esc_reasoning, esc_reasoning_len);
+                    char *esc_args = NULL; int esc_args_len = 0;
+                    JSON_ESCAPE(tc_args, tc_args_len, esc_args, esc_args_len);
+                    char *esc_name = NULL; int esc_name_len = 0;
+                    JSON_ESCAPE(tc_name, 0, esc_name, esc_name_len);
+                    (void)esc_content_len; (void)esc_reasoning_len;
+                    (void)esc_args_len; (void)esc_name_len;
+                    free(reasoning); free(visible_content);
 
-                char hdr[256];
-                int hdr_len = snprintf(hdr, sizeof(hdr),
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: %d\r\n"
-                    "Access-Control-Allow-Origin: *\r\n"
-                    "Connection: close\r\n"
-                    "\r\n", json_len);
-                http_write(client_fd, hdr, hdr_len);
-                http_write(client_fd, json_body, json_len);
-                free(json_body);
+                    char call_id[32];
+                    snprintf(call_id, sizeof(call_id), "call_%04llu", req_counter);
+
+                    size_t jbuf_sz = strlen(esc_content) + strlen(esc_reasoning)
+                                   + strlen(esc_args) + strlen(esc_name) + 640;
+                    char *json_body = malloc(jbuf_sz);
+                    int json_len = snprintf(json_body, jbuf_sz,
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{"
+                        "\"role\":\"assistant\","
+                        "\"content\":\"%s\","
+                        "\"reasoning_content\":\"%s\","
+                        "\"tool_calls\":[{"
+                        "\"id\":\"%s\","
+                        "\"type\":\"function\","
+                        "\"index\":0,"
+                        "\"function\":{"
+                        "\"name\":\"%s\","
+                        "\"arguments\":\"%s\""
+                        "}}]},"
+                        "\"finish_reason\":\"tool_calls\"}],"
+                        "\"usage\":{\"completion_tokens\":%d}}",
+                        request_id, esc_content, esc_reasoning,
+                        call_id, esc_name, esc_args, gen_count);
+
+                    free(esc_content);
+                    free(esc_reasoning);
+                    free(esc_args);
+                    free(esc_name);
+                    free(tc_args);
+
+                    char hdr[256];
+                    int hdr_len = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %d\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Connection: close\r\n"
+                        "\r\n", json_len);
+                    http_write(client_fd, hdr, hdr_len);
+                    http_write(client_fd, json_body, json_len);
+                    free(json_body);
+                } else {
+                    if (tc_args) free(tc_args);
+                    // Normal non-streaming response
+                    size_t rlen = strlen(gen_response);
+                    char *escaped = NULL; int escaped_len = 0;
+                    JSON_ESCAPE(gen_response, rlen, escaped, escaped_len);
+                    (void)escaped_len;
+
+                    char *json_body = malloc(strlen(escaped) + 512);
+                    int json_len = sprintf(json_body,
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                        "\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+                        "\"usage\":{\"completion_tokens\":%d}}",
+                        request_id, escaped, gen_count);
+                    free(escaped);
+
+                    char hdr[256];
+                    int hdr_len = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %d\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Connection: close\r\n"
+                        "\r\n", json_len);
+                    http_write(client_fd, hdr, hdr_len);
+                    http_write(client_fd, json_body, json_len);
+                    free(json_body);
+                }
             }
 
             // ---- Save session state ----
+            g_temperature = saved_temperature;
+            if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
             free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
             // Just record the position so the next request can continue from here.
@@ -6570,12 +7244,14 @@ static void print_usage(const char *prog) {
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --temp T             Sampling temperature (default: 0.0 = greedy argmax)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        srand((unsigned)time(NULL));
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
@@ -6610,12 +7286,13 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"temp",          required_argument, 0, 'X'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:X:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6643,6 +7320,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
+                case 'X': g_temperature = atof(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -7030,7 +7708,7 @@ int main(int argc, char **argv) {
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----
-        int next_token = cpu_argmax(logits, VOCAB_SIZE);
+        int next_token = sample_next_token(logits, VOCAB_SIZE);
         double ttft_ms = now_ms() - t0;
 
         // Debug: show top-5 logits for first token
@@ -7112,7 +7790,7 @@ int main(int argc, char **argv) {
             lm_head_forward(wf, hidden, logits);
 
             // Greedy sample
-            next_token = cpu_argmax(logits, VOCAB_SIZE);
+            next_token = sample_next_token(logits, VOCAB_SIZE);
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
