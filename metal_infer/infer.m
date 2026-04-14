@@ -6326,7 +6326,7 @@ static char *build_system_prompt_with_tools(const char *base_sys,
     static const char *SUFFIX =
         "\n输出格式必须严格为：{\"tool\": \"工具名称\", \"arguments\": {参数对象}}。\n"
         "**重要提示：请判断用户的问题，是否需要调用工具，如果需要调用工具，"
-        "聪明的选择对应的工具，并使用以上格式输出。**\n"
+        "聪明的选择对应的工具，并使用以上格式输出。注意不要重复本格式说明。**\n"
         "如果不需要调用工具，请直接给出普通回答。";
 
     size_t total = strlen(base_sys) + strlen(PREFIX) + strlen(tools_desc) + strlen(SUFFIX) + 4;
@@ -6358,6 +6358,156 @@ static char *load_system_prompt(void) {
         }
     }
     return strdup("You are a helpful assistant. /think");
+}
+
+// Detect if any message in the messages array has role:"tool" (tool result turn).
+static int has_tool_result_message(const char *body) {
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == '"') { p++; if (strncmp(p, "tool\"", 5) == 0) return 1; }
+    }
+    return 0;
+}
+
+// Detect if any message has role:"assistant" (prior assistant turn in conversation).
+static int has_prior_assistant_message(const char *body) {
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == '"') { p++; if (strncmp(p, "assistant\"", 10) == 0) return 1; }
+    }
+    return 0;
+}
+
+// Dynamic string builder helper — appends s (slen bytes, or strlen if -1) to *buf.
+// Grows *buf via realloc. Returns 1 on success, 0 on alloc failure.
+static int sb_append(char **buf, size_t *len, size_t *cap, const char *s, int slen) {
+    if (slen < 0) slen = (int)strlen(s);
+    if (*len + (size_t)slen + 1 >= *cap) {
+        size_t new_cap = (*len + (size_t)slen + 1024) * 2;
+        char *nb = realloc(*buf, new_cap);
+        if (!nb) return 0;
+        *buf = nb; *cap = new_cap;
+    }
+    memcpy(*buf + *len, s, (size_t)slen);
+    *len += (size_t)slen;
+    (*buf)[*len] = '\0';
+    return 1;
+}
+
+// Build a full multi-turn Qwen3.5 chat template prompt from the messages array.
+// Handles role:user, role:assistant (with or without tool_calls), role:tool.
+// sys_prompt: already-assembled system prompt (may include tool descriptions).
+// Returns malloc'd prompt string; caller frees. NULL on error.
+// Extract the content of the last role:"assistant" message from the messages array.
+// Does not mutate body. Returns malloc'd unescaped string; caller frees.
+static char *extract_last_assistant_content_from_messages(const char *body) {
+    const char *p = strstr(body, "\"messages\"");
+    if (!p) return NULL;
+    p = strchr(p, ':');
+    if (!p) return NULL;
+    while (*p == ':' || *p == ' ' || *p == '\t') p++;
+    if (*p != '[') return NULL;
+    p++;
+    const char *body_end = body + strlen(body);
+    char *last = NULL;
+    while (p < body_end) {
+        while (p < body_end && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p==',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+        const char *pp = p;
+        char *obj = extract_json_object(&pp, body_end);
+        if (!obj) break;
+        p = pp;
+        const char *obj_end = obj + strlen(obj);
+        char *role = json_get_string("role", obj, obj_end);
+        if (role && strcmp(role, "assistant") == 0) {
+            if (last) free(last);
+            last = json_get_string("content", obj, obj_end);
+        }
+        if (role) free(role);
+        free(obj);
+    }
+    return last;
+}
+
+static char *build_multiturn_prompt(const char *body, const char *sys_prompt) {
+#define SB(s) do { if (!sb_append(&buf, &len, &cap, (s), -1)) { free(buf); return NULL; } } while(0)
+    size_t cap = strlen(sys_prompt) + 8192;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+    size_t len = 0;
+
+    SB("<|im_start|>system\n"); SB(sys_prompt); SB("<|im_end|>\n");
+
+    const char *p = strstr(body, "\"messages\"");
+    if (!p) goto done;
+    p = strchr(p, ':');
+    if (!p) goto done;
+    while (*p == ':' || *p == ' ' || *p == '\t') p++;
+    if (*p != '[') goto done;
+    p++; // skip '['
+    const char *body_end = body + strlen(body);
+
+    while (p < body_end) {
+        while (p < body_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+
+        const char *pp = p;
+        char *obj = extract_json_object(&pp, body_end);
+        if (!obj) break;
+        p = pp;
+
+        const char *obj_end = obj + strlen(obj);
+        char *role = json_get_string("role", obj, obj_end);
+        if (!role) { free(obj); continue; }
+
+        if (strcmp(role, "system") == 0) {
+            // Skip — we use our own (tool-augmented) system prompt.
+        } else if (strcmp(role, "user") == 0) {
+            char *content = json_get_string("content", obj, obj_end);
+            if (content) {
+                SB("<|im_start|>user\n"); SB(content); SB("<|im_end|>\n");
+                free(content);
+            }
+        } else if (strcmp(role, "assistant") == 0) {
+            SB("<|im_start|>assistant\n");
+            const char *tc_key = strstr(obj, "\"tool_calls\"");
+            if (tc_key && tc_key < obj_end) {
+                // Reconstruct tool call in our flat JSON format
+                char *fn_name = json_get_string("name", tc_key, obj_end);
+                char *fn_args = json_get_string("arguments", tc_key, obj_end);
+                if (fn_name && fn_args) {
+                    SB("{\"tool\": \""); SB(fn_name);
+                    SB("\", \"arguments\": "); SB(fn_args); SB("}");
+                }
+                if (fn_name) free(fn_name);
+                if (fn_args) free(fn_args);
+            } else {
+                char *content = json_get_string("content", obj, obj_end);
+                if (content) { SB(content); free(content); }
+            }
+            SB("<|im_end|>\n");
+        } else if (strcmp(role, "tool") == 0) {
+            char *content = json_get_string("content", obj, obj_end);
+            if (content) {
+                SB("<|im_start|>tool\n"); SB(content); SB("\n<|im_end|>\n");
+                free(content);
+            }
+        }
+        free(role);
+        free(obj);
+    }
+
+done:
+    SB("<|im_start|>assistant\n");
+#undef SB
+    return buf;
 }
 
 // Tokenize a full chat message using an explicit system prompt (for tool requests).
@@ -6597,6 +6747,7 @@ static void serve_loop(
     // We just track whether to restore from snapshot (new session) or continue (same session).
     char active_session_id[64] = {0};
     int session_pos = 0;  // RoPE position after last generation for the active session
+    char *g_last_assistant_content = NULL;  // last gen_response for auto-continuation detection
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6701,7 +6852,43 @@ static void serve_loop(
                     }
                 }
             }
+            // is_continuation only needs session IDs — compute before body mutation
+            int is_continuation = (has_session &&
+                                   active_session_id[0] != '\0' &&
+                                   strcmp(req_session_id, active_session_id) == 0);
+
+            // Detect multi-turn BEFORE extract_last_content mutates body.
+            // need_multiturn: messages has prior history we must replay into the prompt.
+            int is_tool_result  = has_tool_result_message(body);
+            int has_prior_turns = !is_continuation && has_prior_assistant_message(body);
+
+            // Auto-continuation: if the last assistant message matches what we just
+            // generated, the KV cache is already a valid prefix — skip full prefill.
+            int is_auto_continuation = 0;
+            if (has_prior_turns && !is_tool_result && !has_tools
+                    && g_last_assistant_content && session_pos > 0) {
+                char *last_asst = extract_last_assistant_content_from_messages(body);
+                if (last_asst) {
+                    is_auto_continuation = (strcmp(last_asst, g_last_assistant_content) == 0);
+                    free(last_asst);
+                }
+            }
+            if (is_auto_continuation) is_continuation = 1;  // piggyback on continuation path
+            int need_multiturn = is_tool_result || (has_prior_turns && !is_auto_continuation);
+
             char *tools_sys_prompt = NULL;  // malloc'd per-request; freed after response
+            char *multiturn_prompt_str = NULL;
+            if (need_multiturn) {
+                static char *g_base_sys_mt = NULL;
+                if (!g_base_sys_mt) g_base_sys_mt = load_system_prompt();
+                const char *the_sys = g_base_sys_mt;
+                if (has_tools) {
+                    tools_sys_prompt = build_system_prompt_with_tools(
+                        g_base_sys_mt, tools_json_start, tools_json_len);
+                    if (tools_sys_prompt) the_sys = tools_sys_prompt;
+                }
+                multiturn_prompt_str = build_multiturn_prompt(body, the_sys);
+            }
 
             // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
@@ -6709,32 +6896,45 @@ static void serve_loop(
                 http_write_str(client_fd,
                     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"no content in messages\"}\n");
+                if (multiturn_prompt_str) free(multiturn_prompt_str);
+                if (tools_sys_prompt) free(tools_sys_prompt);
                 free(reqbuf); close(client_fd); continue;
             }
-            int is_continuation = (has_session &&
-                                   active_session_id[0] != '\0' &&
-                                   strcmp(req_session_id, active_session_id) == 0);
 
             // Session persistence is handled by the client (chat.m)
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, has_tools=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen, has_tools,
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, has_tools=%d, is_tool_result=%d, has_prior=%d%s, session=%s%s\n",
+                    request_id, strlen(content), max_gen, has_tools, is_tool_result, has_prior_turns,
+                    is_auto_continuation ? "(auto)" : "",
                     has_session ? req_session_id : "(none)",
                     is_continuation ? " [CONTINUE]" : " [NEW]");
             fprintf(stderr, "[serve] %s request body: %.500s\n", request_id, body);
 
             // ---- Tokenize ----
-            // Tool requests: full cold prefill with system+tools+user from pos=0
-            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
-            // New session: just the user turn (system prompt restored from snapshot)
-            int do_full_prefill = has_tools;
+            // need_multiturn: build full Qwen3.5 chat template from messages array
+            // is_continuation: KV cache has prior turns — append new user turn only
+            // has_tools: single first-turn tool request — inject tools into system prompt
+            // else: fresh single-turn request
+            int do_full_prefill = need_multiturn || has_tools;
             PromptTokens *pt;
             if (is_continuation && !do_full_prefill) {
                 pt = tokenize_continuation_turn(content);
-            } else if (do_full_prefill) {
+            } else if (need_multiturn) {
+                if (!multiturn_prompt_str) {
+                    http_write_str(client_fd,
+                        "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                        "{\"error\":\"failed to build multiturn prompt\"}\n");
+                    if (tools_sys_prompt) free(tools_sys_prompt);
+                    free(reqbuf); close(client_fd); continue;
+                }
+                pt = encode_prompt_text_to_tokens(multiturn_prompt_str);
+                free(multiturn_prompt_str);
+                multiturn_prompt_str = NULL;
+            } else if (has_tools) {
+                // Single first-turn tool request (no prior assistant turns)
                 static char *g_base_sys = NULL;
                 if (!g_base_sys) g_base_sys = load_system_prompt();
                 tools_sys_prompt = build_system_prompt_with_tools(
@@ -6759,7 +6959,7 @@ static void serve_loop(
 
             fprintf(stderr, "[serve] %s prompt=%d tokens%s%s\n", request_id, pt->count,
                     is_continuation ? " (continuation)" : "",
-                    do_full_prefill ? " (full-prefill, tools)" : "");
+                    do_full_prefill ? " (full-prefill)" : "");
 
             int pos;
             if (is_continuation && !do_full_prefill) {
@@ -7182,6 +7382,10 @@ static void serve_loop(
             // ---- Save session state ----
             g_temperature = saved_temperature;
             if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
+            // Store last generated content for auto-continuation on next stateless request.
+            // Invalidate if the KV cache contains a tool-augmented system prompt (different prefix).
+            if (g_last_assistant_content) { free(g_last_assistant_content); g_last_assistant_content = NULL; }
+            if (!has_tools && !is_tool_result) g_last_assistant_content = strdup(gen_response);
             free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
             // Just record the position so the next request can continue from here.
