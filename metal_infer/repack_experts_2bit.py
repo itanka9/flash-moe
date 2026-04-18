@@ -2,20 +2,20 @@
 """
 repack_experts_2bit.py — Requantize 4-bit packed expert files to 2-bit format.
 
-Reads packed_experts/layer_XX.bin files (256 experts x 5,308,416 bytes each)
-and writes packed_experts_2bit/layer_XX.bin (256 experts x 2,949,120 bytes each).
+Reads packed_experts/layer_XX.bin files (256 experts x 1,769,472 bytes each)
+and writes packed_experts_2bit/layer_XX.bin (256 experts x 983,040 bytes each).
 
-4-bit format (per expert, 5,308,416 bytes):
-  gate_proj: weights [1024, 384] u32 + scales [1024, 48] bf16 + biases [1024, 48] bf16
-  up_proj:   weights [1024, 384] u32 + scales [1024, 48] bf16 + biases [1024, 48] bf16
-  down_proj: weights [3072, 128] u32 + scales [3072, 16] bf16 + biases [3072, 16] bf16
-  Total: 5,308,416 bytes
+4-bit format (per expert, 1,769,472 bytes):
+  gate_proj: weights [512, 256] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
+  up_proj:   weights [512, 256] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
+  down_proj: weights [2048, 64] u32 + scales [2048, 8] bf16 + biases [2048, 8] bf16
+  Total: 1,769,472 bytes
 
-2-bit format (per expert, 2,949,120 bytes):
-  gate_proj: weights [1024, 192] u32 + scales [1024, 48] bf16 + biases [1024, 48] bf16
-  up_proj:   weights [1024, 192] u32 + scales [1024, 48] bf16 + biases [1024, 48] bf16
-  down_proj: weights [3072,  64] u32 + scales [3072, 16] bf16 + biases [3072, 16] bf16
-  Total: 2,949,120 bytes  (44.5% reduction)
+2-bit format (per expert, 983,040 bytes):
+  gate_proj: weights [512, 128] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
+  up_proj:   weights [512, 128] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
+  down_proj: weights [2048, 32] u32 + scales [2048, 8] bf16 + biases [2048, 8] bf16
+  Total: 983,040 bytes  (44.4% reduction)
 
 Requantization per group of 64 values:
   1. Dequantize: f[i] = uint4[i] * scale + bias  (range 0-15 mapped affinely)
@@ -39,34 +39,34 @@ from pathlib import Path
 
 
 # ============================================================================
-# 4-bit expert layout (matches main.m / infer.m constants)
+# 4-bit expert layout (matches infer.m constants, 35B: hidden=2048, moe_int=512)
 # ============================================================================
 
-EXPERT_SIZE_4BIT = 5_308_416
+EXPERT_SIZE_4BIT = 1_769_472
 NUM_EXPERTS = 256
 GROUP_SIZE = 64
 
-# Byte offsets and sizes within a 4-bit expert blob (122B: hidden=3072, moe_intermediate=1024)
+# Byte offsets and sizes within a 4-bit expert blob
 GATE_W_OFF_4 = 0
-GATE_W_SIZE_4 = 1_572_864   # [1024, 384] uint32 = 1024 * 384 * 4
-GATE_S_OFF_4 = 1_572_864
-GATE_S_SIZE_4 = 98_304      # [1024, 48] uint16 = 1024 * 48 * 2
-GATE_B_OFF_4 = 1_671_168
-GATE_B_SIZE_4 = 98_304
+GATE_W_SIZE_4 = 524_288    # [512, 256] uint32 = 512 * 256 * 4
+GATE_S_OFF_4 = 524_288
+GATE_S_SIZE_4 = 32_768     # [512, 32] uint16 = 512 * 32 * 2
+GATE_B_OFF_4 = 557_056
+GATE_B_SIZE_4 = 32_768
 
-UP_W_OFF_4 = 1_769_472
-UP_W_SIZE_4 = 1_572_864     # [1024, 384] uint32
-UP_S_OFF_4 = 3_342_336
-UP_S_SIZE_4 = 98_304        # [1024, 48] uint16
-UP_B_OFF_4 = 3_440_640
-UP_B_SIZE_4 = 98_304
+UP_W_OFF_4 = 589_824
+UP_W_SIZE_4 = 524_288      # [512, 256] uint32
+UP_S_OFF_4 = 1_114_112
+UP_S_SIZE_4 = 32_768       # [512, 32] uint16
+UP_B_OFF_4 = 1_146_880
+UP_B_SIZE_4 = 32_768
 
-DOWN_W_OFF_4 = 3_538_944
-DOWN_W_SIZE_4 = 1_572_864   # [3072, 128] uint32
-DOWN_S_OFF_4 = 5_111_808
-DOWN_S_SIZE_4 = 98_304      # [3072, 16] uint16
-DOWN_B_OFF_4 = 5_210_112
-DOWN_B_SIZE_4 = 98_304
+DOWN_W_OFF_4 = 1_179_648
+DOWN_W_SIZE_4 = 524_288    # [2048, 64] uint32 = 2048 * 64 * 4
+DOWN_S_OFF_4 = 1_703_936
+DOWN_S_SIZE_4 = 32_768     # [2048, 8] uint16 = 2048 * 8 * 2
+DOWN_B_OFF_4 = 1_736_704
+DOWN_B_SIZE_4 = 32_768
 
 assert GATE_W_OFF_4 + GATE_W_SIZE_4 == GATE_S_OFF_4
 assert GATE_S_OFF_4 + GATE_S_SIZE_4 == GATE_B_OFF_4
@@ -80,9 +80,9 @@ assert DOWN_B_OFF_4 + DOWN_B_SIZE_4 == EXPERT_SIZE_4BIT
 
 # Projection descriptors: (name, out_dim, in_dim, w_off, s_off, b_off)
 PROJS_4BIT = [
-    ("gate", 1024, 3072, GATE_W_OFF_4, GATE_S_OFF_4, GATE_B_OFF_4),
-    ("up",   1024, 3072, UP_W_OFF_4,   UP_S_OFF_4,   UP_B_OFF_4),
-    ("down", 3072, 1024, DOWN_W_OFF_4, DOWN_S_OFF_4,  DOWN_B_OFF_4),
+    ("gate", 512,  2048, GATE_W_OFF_4, GATE_S_OFF_4, GATE_B_OFF_4),
+    ("up",   512,  2048, UP_W_OFF_4,   UP_S_OFF_4,   UP_B_OFF_4),
+    ("down", 2048, 512,  DOWN_W_OFF_4, DOWN_S_OFF_4,  DOWN_B_OFF_4),
 ]
 
 
@@ -90,35 +90,35 @@ PROJS_4BIT = [
 # 2-bit expert layout
 # ============================================================================
 # Weight arrays halve: 16 x 2-bit values per uint32 instead of 8 x 4-bit
-# gate/up weights: [1024, 192] uint32 = 786,432 bytes (was [1024, 384])
-# down weights:    [3072,  64] uint32 = 786,432 bytes (was [3072, 128])
+# gate/up weights: [512, 128] uint32 = 262,144 bytes (was [512, 256])
+# down weights:    [2048, 32] uint32 = 262,144 bytes (was [2048, 64])
 # Scales/biases: identical shape to 4-bit (group_size=64 preserved)
 
-GATE_W_SIZE_2 = 786_432     # [1024, 192] uint32 = 1024 * 192 * 4
-UP_W_SIZE_2   = 786_432     # [1024, 192] uint32
-DOWN_W_SIZE_2 = 786_432     # [3072,  64] uint32 = 3072 * 64 * 4
+GATE_W_SIZE_2 = 262_144    # [512, 128] uint32 = 512 * 128 * 4
+UP_W_SIZE_2   = 262_144    # [512, 128] uint32
+DOWN_W_SIZE_2 = 262_144    # [2048, 32] uint32 = 2048 * 32 * 4
 
 # 2-bit layout byte offsets (contiguous, same order as 4-bit)
 GATE_W_OFF_2 = 0
-GATE_S_OFF_2 = GATE_W_OFF_2 + GATE_W_SIZE_2                          #   786,432
-GATE_B_OFF_2 = GATE_S_OFF_2 + GATE_S_SIZE_4                          #   884,736
-UP_W_OFF_2   = GATE_B_OFF_2 + GATE_B_SIZE_4                          #   983,040
-UP_S_OFF_2   = UP_W_OFF_2   + UP_W_SIZE_2                            # 1,769,472
-UP_B_OFF_2   = UP_S_OFF_2   + UP_S_SIZE_4                            # 1,867,776
-DOWN_W_OFF_2 = UP_B_OFF_2   + UP_B_SIZE_4                            # 1,966,080
-DOWN_S_OFF_2 = DOWN_W_OFF_2 + DOWN_W_SIZE_2                          # 2,752,512
-DOWN_B_OFF_2 = DOWN_S_OFF_2 + DOWN_S_SIZE_4                          # 2,850,816
-EXPERT_SIZE_2BIT = DOWN_B_OFF_2 + DOWN_B_SIZE_4                       # 2,949,120
+GATE_S_OFF_2 = GATE_W_OFF_2 + GATE_W_SIZE_2                          #   262,144
+GATE_B_OFF_2 = GATE_S_OFF_2 + GATE_S_SIZE_4                          #   294,912
+UP_W_OFF_2   = GATE_B_OFF_2 + GATE_B_SIZE_4                          #   327,680
+UP_S_OFF_2   = UP_W_OFF_2   + UP_W_SIZE_2                            #   589,824
+UP_B_OFF_2   = UP_S_OFF_2   + UP_S_SIZE_4                            #   622,592
+DOWN_W_OFF_2 = UP_B_OFF_2   + UP_B_SIZE_4                            #   655,360
+DOWN_S_OFF_2 = DOWN_W_OFF_2 + DOWN_W_SIZE_2                          #   917,504
+DOWN_B_OFF_2 = DOWN_S_OFF_2 + DOWN_S_SIZE_4                          #   950,272
+EXPERT_SIZE_2BIT = DOWN_B_OFF_2 + DOWN_B_SIZE_4                       #   983,040
 
-assert GATE_S_OFF_2 == 786_432
-assert GATE_B_OFF_2 == 884_736
-assert UP_W_OFF_2   == 983_040
-assert UP_S_OFF_2   == 1_769_472
-assert UP_B_OFF_2   == 1_867_776
-assert DOWN_W_OFF_2 == 1_966_080
-assert DOWN_S_OFF_2 == 2_752_512
-assert DOWN_B_OFF_2 == 2_850_816
-assert EXPERT_SIZE_2BIT == 2_949_120
+assert GATE_S_OFF_2 == 262_144
+assert GATE_B_OFF_2 == 294_912
+assert UP_W_OFF_2   == 327_680
+assert UP_S_OFF_2   == 589_824
+assert UP_B_OFF_2   == 622_592
+assert DOWN_W_OFF_2 == 655_360
+assert DOWN_S_OFF_2 == 917_504
+assert DOWN_B_OFF_2 == 950_272
+assert EXPERT_SIZE_2BIT == 983_040
 
 # Offsets for writing into the 2-bit output blob
 PROJS_2BIT_OFFSETS = {
@@ -403,12 +403,12 @@ def main():
         description='Requantize 4-bit packed experts to 2-bit')
     parser.add_argument('--model', type=str,
                         default=os.path.expanduser(
-                            '~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit'),
+                            '/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit'),
                         help='Path to model directory (containing packed_experts/)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory (default: MODEL/packed_experts_2bit)')
     parser.add_argument('--layer', type=int, default=None,
-                        help='Process only this layer (0-59). Default: all layers.')
+                        help='Process only this layer (0-39). Default: all layers.')
     parser.add_argument('--verify', action='store_true',
                         help='Verify by dequantizing 2-bit output and comparing to 4-bit')
     parser.add_argument('--experts', type=int, default=NUM_EXPERTS,
@@ -430,7 +430,7 @@ def main():
         layers = [args.layer]
     else:
         layers = []
-        for i in range(48):
+        for i in range(40):
             if (input_dir / f'layer_{i:02d}.bin').exists():
                 layers.append(i)
         if not layers:

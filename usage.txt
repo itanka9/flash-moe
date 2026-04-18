@@ -1,6 +1,7 @@
-Flash-MoE: Qwen3.5-122B-A10B Usage
+Flash-MoE: Qwen3.6-35B-A3B Usage
 ================================================================================
-Model: ~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit
+Model: ~/.cache/modelscope/hub/models/mlx-community/Qwen3___6-35B-A3B-4bit
+       (symlinked as metal_infer/Qwen3.6-35B-A3B-4bit)
 
 STEP 1 — Generate expert index
 ================================================================================
@@ -12,18 +13,18 @@ STEP 1 — Generate expert index
 STEP 2 — Extract non-expert weights
 ================================================================================
     cd /Users/dan/LLM/flash-moe/metal_infer
-    python extract_weights.py
+    python extract_weights.py --model ../Qwen3.6-35B-A3B-4bit --output .
 
-    Outputs: model_weights.bin (~4GB), model_weights.json
+    Outputs: model_weights.bin (~1.5GB), model_weights.json
 
 STEP 3 — Export tokenizer and vocab
 ================================================================================
     cd /Users/dan/LLM/flash-moe/metal_infer
     python export_tokenizer.py \
-        ~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/tokenizer.json \
+        Qwen3.6-35B-A3B-4bit/tokenizer.json \
         tokenizer.bin
     python export_vocab.py \
-        ~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/tokenizer.json \
+        Qwen3.6-35B-A3B-4bit/tokenizer.json \
         vocab.bin
 
     Outputs: tokenizer.bin (~20MB, BPE encoder), vocab.bin (~3MB, token id->string decoder)
@@ -32,12 +33,14 @@ STEP 4 — Repack expert weights (4-bit)
 ================================================================================
     cd /Users/dan/LLM/flash-moe
     python repack_experts.py --dry-run    # verify first
-    python repack_experts.py              # write ~65 GB to packed_experts/
+    python repack_experts.py              # write ~18 GB to packed_experts/
 
     Options:
       --layers 0-4       repack only layers 0-4
       --layers 0,5,10    repack specific layers
       --verify-only 0    verify layer 0 against originals
+
+    Layout: 40 layers × 256 experts × 1,769,472 bytes = ~452 MB per layer
 
 STEP 4b — Repack expert weights to 2-bit (optional, faster but lower quality)
 ================================================================================
@@ -46,10 +49,10 @@ STEP 4b — Repack expert weights to 2-bit (optional, faster but lower quality)
     # Test a single layer first (with verification)
     python metal_infer/repack_experts_2bit.py --layer 0 --verify
 
-    # Repack all 48 layers (~32 GB output, vs ~65 GB for 4-bit)
+    # Repack all 40 layers (~10 GB output, vs ~18 GB for 4-bit)
     python metal_infer/repack_experts_2bit.py
 
-    Output: packed_experts_2bit/layer_XX.bin (2,949,120 bytes per expert × 256 experts)
+    Output: packed_experts_2bit/layer_XX.bin (983,040 bytes per expert × 256 experts)
 
     Note: 2-bit mode is faster but breaks JSON/tool calling (produces \name\ instead of
     "name"). Use 4-bit for production; 2-bit for speed experiments only.
@@ -67,7 +70,7 @@ STEP 6 — Inference
     # With per-layer timing
     ./infer --prompt "Hello" --tokens 20 --timing
 
-    # More active experts (default K=4, max K=8 for 122B)
+    # More active experts (default K=8, max K=8 for 35B)
     ./infer --prompt "Write a haiku" --tokens 50 --k 8
 
     # 2-bit mode (faster, breaks tool calling / JSON — requires Step 4b)

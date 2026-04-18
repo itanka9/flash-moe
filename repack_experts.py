@@ -11,7 +11,7 @@ Within each expert block, 9 components packed in fixed order:
   down_proj.weight,  down_proj.scales,  down_proj.biases
 
 Usage:
-    python repack_experts.py                    # repack all 48 layers
+    python repack_experts.py                    # repack all 40 layers
     python repack_experts.py --layers 0-4       # repack layers 0-4
     python repack_experts.py --layers 0,5,10    # repack specific layers
     python repack_experts.py --dry-run           # verify without writing
@@ -24,22 +24,24 @@ import os
 import time
 import sys
 
-# Component order and expected sizes (122B: hidden=3072, moe_intermediate=1024, group_size=64)
+# Component order and expected sizes (35B: hidden=2048, moe_intermediate=512, group_size=64)
+# gate/up [512, 2048]: weight=512*(2048/8)=131072 U32, scales=512*(2048/64)=512*32=16384 BF16
+# down [2048, 512]:    weight=2048*(512/8)=131072 U32, scales=2048*(512/64)=2048*8=16384 BF16
 COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,        "size": 1572864, "dtype": "U32",  "shape": [1024, 384]},
-    {"name": "gate_proj.scales",  "offset": 1572864,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
-    {"name": "gate_proj.biases",  "offset": 1671168,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
-    {"name": "up_proj.weight",    "offset": 1769472,  "size": 1572864, "dtype": "U32",  "shape": [1024, 384]},
-    {"name": "up_proj.scales",    "offset": 3342336,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
-    {"name": "up_proj.biases",    "offset": 3440640,  "size": 98304,   "dtype": "BF16", "shape": [1024, 48]},
-    {"name": "down_proj.weight",  "offset": 3538944,  "size": 1572864, "dtype": "U32",  "shape": [3072, 128]},
-    {"name": "down_proj.scales",  "offset": 5111808,  "size": 98304,   "dtype": "BF16", "shape": [3072, 16]},
-    {"name": "down_proj.biases",  "offset": 5210112,  "size": 98304,   "dtype": "BF16", "shape": [3072, 16]},
+    {"name": "gate_proj.weight",  "offset": 0,       "size": 524288, "dtype": "U32",  "shape": [512, 256]},
+    {"name": "gate_proj.scales",  "offset": 524288,  "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+    {"name": "gate_proj.biases",  "offset": 557056,  "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+    {"name": "up_proj.weight",    "offset": 589824,  "size": 524288, "dtype": "U32",  "shape": [512, 256]},
+    {"name": "up_proj.scales",    "offset": 1114112, "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+    {"name": "up_proj.biases",    "offset": 1146880, "size": 32768,  "dtype": "BF16", "shape": [512, 32]},
+    {"name": "down_proj.weight",  "offset": 1179648, "size": 524288, "dtype": "U32",  "shape": [2048, 64]},
+    {"name": "down_proj.scales",  "offset": 1703936, "size": 32768,  "dtype": "BF16", "shape": [2048, 8]},
+    {"name": "down_proj.biases",  "offset": 1736704, "size": 32768,  "dtype": "BF16", "shape": [2048, 8]},
 ]
 
-EXPERT_SIZE = 5308416   # bytes per expert
+EXPERT_SIZE = 1769472   # bytes per expert
 NUM_EXPERTS = 256
-NUM_LAYERS = 48
+NUM_LAYERS = 40
 LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 1,358,954,496 bytes (~1.36 GB)
 
 
@@ -213,7 +215,7 @@ def write_layout(output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
-    parser.add_argument('--index', default=os.path.expanduser('~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/expert_index.json'),
+    parser.add_argument('--index', default=os.path.expanduser('/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit/expert_index.json'),
                         help='Path to expert_index.json')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')

@@ -11,9 +11,9 @@ Each layer's experts are stored as stacked tensors:
   switch_mlp.up_proj.weight    shape [256, 1024, 384]  dtype U32
   switch_mlp.up_proj.scales    shape [256, 1024,  48]  dtype BF16
   switch_mlp.up_proj.biases    shape [256, 1024,  48]  dtype BF16
-  switch_mlp.down_proj.weight  shape [256, 3072, 128]  dtype U32
-  switch_mlp.down_proj.scales  shape [256, 3072,  16]  dtype BF16
-  switch_mlp.down_proj.biases  shape [256, 3072,  16]  dtype BF16
+  switch_mlp.down_proj.weight  shape [256, 2048, 64]  dtype U32
+  switch_mlp.down_proj.scales  shape [256, 2048,  8]  dtype BF16
+  switch_mlp.down_proj.biases  shape [256, 2048,  8]  dtype BF16
 
 expert_stride = total_tensor_bytes / num_experts
 abs_offset    = file data_start + tensor data_offsets[0] + expert_idx * expert_stride
@@ -43,7 +43,7 @@ COMPONENT_MAP = {
     "down_proj.biases": "mlp.switch_mlp.down_proj.biases",
 }
 
-NUM_LAYERS  = 48
+NUM_LAYERS  = 40
 NUM_EXPERTS = 256
 PREFIX      = "language_model.model.layers"
 
@@ -65,7 +65,7 @@ def main():
     parser.add_argument(
         "--model",
         default=os.path.expanduser(
-            "~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit"
+            "/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit"
         ),
         help="Path to model directory containing safetensors files",
     )
