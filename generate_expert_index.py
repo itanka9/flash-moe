@@ -43,8 +43,6 @@ COMPONENT_MAP = {
     "down_proj.biases": "mlp.switch_mlp.down_proj.biases",
 }
 
-NUM_LAYERS  = 40
-NUM_EXPERTS = 256
 PREFIX      = "language_model.model.layers"
 
 
@@ -64,9 +62,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate expert_index.json for repack_experts.py")
     parser.add_argument(
         "--model",
-        default=os.path.expanduser(
-            "/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit"
-        ),
+        required=True,
         help="Path to model directory containing safetensors files",
     )
     parser.add_argument(
@@ -88,6 +84,29 @@ def main():
         st_index = json.load(f)
     weight_map = st_index["weight_map"]  # tensor_name -> filename
 
+    # Auto-detect NUM_LAYERS and NUM_EXPERTS from config.json
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            model_cfg = json.load(f)
+        NUM_LAYERS = model_cfg.get("num_hidden_layers", 60)
+        NUM_EXPERTS = model_cfg.get("num_experts", 512)
+    else:
+        # Fallback: detect from weight_map keys
+        import re
+        layer_nums = set()
+        for name in weight_map:
+            m = re.match(r'language_model\.model\.layers\.(\d+)\.', name)
+            if m:
+                layer_nums.add(int(m.group(1)))
+        NUM_LAYERS = max(layer_nums) + 1 if layer_nums else 60
+        # Detect experts from tensor shapes
+        NUM_EXPERTS = 512  # fallback
+        print(f"WARNING: config.json not found, auto-detected {NUM_LAYERS} layers")
+
+    print(f"Model: {model_path}")
+    print(f"Layers: {NUM_LAYERS}, Experts: {NUM_EXPERTS}")
+
     # Load headers for all required shard files (cache to avoid re-reading)
     header_cache = {}  # filename -> (header, data_start)
 
@@ -101,7 +120,6 @@ def main():
     # Build expert_reads dict
     expert_reads = {}  # layer_idx (str) -> {comp_name -> {file, abs_offset, expert_stride, expert_size}}
 
-    print(f"Model: {model_path}")
     print(f"Scanning {NUM_LAYERS} layers × {len(COMPONENT_MAP)} components ...\n")
 
     for layer_idx in range(NUM_LAYERS):

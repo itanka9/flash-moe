@@ -66,82 +66,224 @@
 #include <compression.h>
 
 // ============================================================================
-// Model constants
+// Model configuration — loaded from model_weights.json at runtime
 // ============================================================================
 
-#define HIDDEN_DIM          2048
-#define NUM_LAYERS          40
-#define NUM_ATTN_HEADS      16
-#define NUM_KV_HEADS        2
-#define HEAD_DIM            256
-#define VOCAB_SIZE          248320
+// Maximum array sizes for struct declarations (covers all known Qwen3.x-MoE models)
+#define MAX_LAYERS              64
+#define MAX_FULL_ATTN_LAYERS    16
+#define MAX_LINEAR_LAYERS       48
+#define MAX_K                   16   // maximum experts per token
+#define MAX_EXPERTS             512  // maximum experts per layer
+#define MAX_HIDDEN_DIM          4096 // maximum hidden dimension
+
+// Fixed constants that don't vary across models
 #define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         256
-#define NUM_EXPERTS_PER_TOK 8
-#define MOE_INTERMEDIATE    512
-#define SHARED_INTERMEDIATE 512
-#define FULL_ATTN_INTERVAL  4
-#define GROUP_SIZE          64
-#define BITS                4
-
-// Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  32
-#define LINEAR_NUM_K_HEADS  16
-#define LINEAR_KEY_DIM      128   // head_k_dim
-#define LINEAR_VALUE_DIM    128   // head_v_dim
-#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 4096
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 8192
 #define CONV_KERNEL_SIZE    4
+#define MAX_SEQ_LEN         1048576  // 1M context
+#define GPU_KV_SEQ          8192     // GPU KV buffer pre-allocation
 
-// Derived state sizes (used for Metal buffer allocation and memset)
-#define DELTA_STATE_SIZE    (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM)  // 32*128*128
-
-// Full attention constants
-#define ROPE_THETA          10000000.0f
-#define PARTIAL_ROTARY      0.25f
-#define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
-
-// Expert packed binary layout (gate+up+down, 4-bit, group_size=64)
-// gate/up [MOE_INT, HIDDEN]: weight=MOE_INT*HIDDEN/2 + scales+biases=MOE_INT*(HIDDEN/64)*4
-// down [HIDDEN, MOE_INT]:    weight=HIDDEN*MOE_INT/2 + scales+biases=HIDDEN*(MOE_INT/64)*4
-// Total = 3 * (512*2048/2 + 512*32*4) = 3 * 589824 = 1769472
-#define EXPERT_SIZE         1769472
-
-// 4-bit expert layout offsets
-#define GATE_W_OFF    0
-#define GATE_S_OFF    524288
-#define GATE_B_OFF    557056
-#define UP_W_OFF      589824
-#define UP_S_OFF      1114112
-#define UP_B_OFF      1146880
-#define DOWN_W_OFF    1179648
-#define DOWN_S_OFF    1703936
-#define DOWN_B_OFF    1736704
-
-// 2-bit expert layout (gate/up [MOE_INT,HIDDEN]/4 + scales; down [HIDDEN,MOE_INT]/4 + scales)
-#define EXPERT_SIZE_2BIT    983040
-#define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  262144
-#define GATE_B_OFF_2  294912
-#define UP_W_OFF_2    327680
-#define UP_S_OFF_2    589824
-#define UP_B_OFF_2    622592
-#define DOWN_W_OFF_2  655360
-#define DOWN_S_OFF_2  917504
-#define DOWN_B_OFF_2  950272
-
-// KV cache maximum context length
-#define MAX_SEQ_LEN 1048576  // 1M context — only 12 full-attn layers need KV cache, ~12GB at max
-#define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
-
-// Special tokens
+// Special tokens (Qwen3.x family)
 #define EOS_TOKEN_1         248046
 #define EOS_TOKEN_2         248044
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit"
+// Runtime model configuration (populated from model_weights.json "config" section)
+typedef struct {
+    // Core dimensions
+    int hidden_dim;
+    int num_layers;
+    int num_attn_heads;
+    int num_kv_heads;
+    int head_dim;
+    int vocab_size;
+    int num_experts;
+    int num_experts_per_tok;
+    int moe_intermediate;
+    int shared_intermediate;
+    int full_attn_interval;
+    int group_size;
+    int bits;
+
+    // Linear attention (GatedDeltaNet)
+    int linear_num_v_heads;
+    int linear_num_k_heads;
+    int linear_key_dim;
+    int linear_value_dim;
+
+    // Full attention
+    float rope_theta;
+    float partial_rotary;
+
+    // Gate quantization (4 or 8 bits)
+    int gate_bits;
+
+    // --- Derived values (computed after loading) ---
+    int linear_total_key;     // linear_num_k_heads * linear_key_dim
+    int linear_total_value;   // linear_num_v_heads * linear_value_dim
+    int linear_conv_dim;      // linear_total_key * 2 + linear_total_value
+    int delta_state_size;     // linear_num_v_heads * linear_value_dim * linear_key_dim
+    int rotary_dim;           // (int)(head_dim * partial_rotary)
+    int num_full_attn_layers; // num_layers / full_attn_interval
+    int num_linear_layers;    // num_layers - num_full_attn_layers
+
+    // Expert layout offsets (4-bit)
+    size_t expert_size;
+    size_t gate_w_off, gate_s_off, gate_b_off;
+    size_t up_w_off, up_s_off, up_b_off;
+    size_t down_w_off, down_s_off, down_b_off;
+
+    // Expert layout offsets (2-bit)
+    size_t expert_size_2bit;
+    size_t gate_w_off_2, gate_s_off_2, gate_b_off_2;
+    size_t up_w_off_2, up_s_off_2, up_b_off_2;
+    size_t down_w_off_2, down_s_off_2, down_b_off_2;
+
+    // Model path
+    char model_path[1024];
+} ModelConfig;
+
+// Global config instance
+static ModelConfig CFG = {0};
+
+// Compute derived values and expert layout offsets from base config
+static void config_compute_derived(ModelConfig *c) {
+    c->linear_total_key   = c->linear_num_k_heads * c->linear_key_dim;
+    c->linear_total_value = c->linear_num_v_heads * c->linear_value_dim;
+    c->linear_conv_dim    = c->linear_total_key * 2 + c->linear_total_value;
+    c->delta_state_size   = c->linear_num_v_heads * c->linear_value_dim * c->linear_key_dim;
+    c->rotary_dim         = (int)(c->head_dim * c->partial_rotary);
+    c->num_full_attn_layers = c->num_layers / c->full_attn_interval;
+    c->num_linear_layers    = c->num_layers - c->num_full_attn_layers;
+
+    // 4-bit expert layout: gate[MOE_INT, HIDDEN], up[MOE_INT, HIDDEN], down[HIDDEN, MOE_INT]
+    int H = c->hidden_dim;
+    int M = c->moe_intermediate;
+    int G = c->group_size;
+    // gate_proj: weight = M*H/2 bytes (4-bit packed), scales = M*(H/G)*2, biases = M*(H/G)*2
+    size_t gate_w_size = (size_t)M * H / 2;
+    size_t gate_s_size = (size_t)M * (H / G) * 2;
+    size_t gate_b_size = gate_s_size;
+    // up_proj: same as gate
+    size_t up_w_size = gate_w_size;
+    size_t up_s_size = gate_s_size;
+    size_t up_b_size = gate_b_size;
+    // down_proj: weight = H*M/2, scales = H*(M/G)*2, biases = H*(M/G)*2
+    size_t down_w_size = (size_t)H * M / 2;
+    size_t down_s_size = (size_t)H * (M / G) * 2;
+    size_t down_b_size = down_s_size;
+
+    c->gate_w_off = 0;
+    c->gate_s_off = c->gate_w_off + gate_w_size;
+    c->gate_b_off = c->gate_s_off + gate_s_size;
+    c->up_w_off   = c->gate_b_off + gate_b_size;
+    c->up_s_off   = c->up_w_off + up_w_size;
+    c->up_b_off   = c->up_s_off + up_s_size;
+    c->down_w_off = c->up_b_off + up_b_size;
+    c->down_s_off = c->down_w_off + down_w_size;
+    c->down_b_off = c->down_s_off + down_s_size;
+    c->expert_size = c->down_b_off + down_b_size;
+
+    // 2-bit expert layout: weight = M*H/4, scales = M*(H/G)*2, biases = M*(H/G)*2
+    size_t gate_w_size_2 = (size_t)M * H / 4;
+    size_t gate_s_size_2 = gate_s_size;  // same scale/bias layout
+    size_t gate_b_size_2 = gate_b_size;
+    size_t up_w_size_2   = gate_w_size_2;
+    size_t up_s_size_2   = gate_s_size_2;
+    size_t up_b_size_2   = gate_b_size_2;
+    size_t down_w_size_2 = (size_t)H * M / 4;
+    size_t down_s_size_2 = down_s_size;
+    size_t down_b_size_2 = down_b_size;
+
+    c->gate_w_off_2 = 0;
+    c->gate_s_off_2 = c->gate_w_off_2 + gate_w_size_2;
+    c->gate_b_off_2 = c->gate_s_off_2 + gate_s_size_2;
+    c->up_w_off_2   = c->gate_b_off_2 + gate_b_size_2;
+    c->up_s_off_2   = c->up_w_off_2 + up_w_size_2;
+    c->up_b_off_2   = c->up_s_off_2 + up_s_size_2;
+    c->down_w_off_2 = c->up_b_off_2 + up_b_size_2;
+    c->down_s_off_2 = c->down_w_off_2 + down_w_size_2;
+    c->down_b_off_2 = c->down_s_off_2 + down_s_size_2;
+    c->expert_size_2bit = c->down_b_off_2 + down_b_size_2;
+}
+
+// Set default config (Qwen3.5-397B-A17B — largest model)
+static void config_set_defaults(ModelConfig *c) {
+    c->hidden_dim = 4096;
+    c->num_layers = 60;
+    c->num_attn_heads = 32;
+    c->num_kv_heads = 2;
+    c->head_dim = 256;
+    c->vocab_size = 248320;
+    c->num_experts = 512;
+    c->num_experts_per_tok = 10;
+    c->moe_intermediate = 1024;
+    c->shared_intermediate = 1024;
+    c->full_attn_interval = 4;
+    c->group_size = 64;
+    c->bits = 4;
+    c->linear_num_v_heads = 64;
+    c->linear_num_k_heads = 16;
+    c->linear_key_dim = 128;
+    c->linear_value_dim = 128;
+    c->rope_theta = 10000000.0f;
+    c->partial_rotary = 0.25f;
+    c->gate_bits = 4;  // default: 4-bit gate (397B, 122B)
+    snprintf(c->model_path, sizeof(c->model_path), ".");
+    config_compute_derived(c);
+}
+
+// Convenience macros for backward compatibility during migration
+// These read from the global CFG and will be removed once migration is complete.
+#define HIDDEN_DIM          (CFG.hidden_dim)
+#define NUM_LAYERS          (CFG.num_layers)
+#define NUM_ATTN_HEADS      (CFG.num_attn_heads)
+#define NUM_KV_HEADS        (CFG.num_kv_heads)
+#define HEAD_DIM            (CFG.head_dim)
+#define VOCAB_SIZE          (CFG.vocab_size)
+#define NUM_EXPERTS         (CFG.num_experts)
+#define NUM_EXPERTS_PER_TOK (CFG.num_experts_per_tok)
+#define MOE_INTERMEDIATE    (CFG.moe_intermediate)
+#define SHARED_INTERMEDIATE (CFG.shared_intermediate)
+#define FULL_ATTN_INTERVAL  (CFG.full_attn_interval)
+#define GROUP_SIZE          (CFG.group_size)
+#define BITS                (CFG.bits)
+#define LINEAR_NUM_V_HEADS  (CFG.linear_num_v_heads)
+#define LINEAR_NUM_K_HEADS  (CFG.linear_num_k_heads)
+#define LINEAR_KEY_DIM      (CFG.linear_key_dim)
+#define LINEAR_VALUE_DIM    (CFG.linear_value_dim)
+#define LINEAR_TOTAL_KEY    (CFG.linear_total_key)
+#define LINEAR_TOTAL_VALUE  (CFG.linear_total_value)
+#define LINEAR_CONV_DIM     (CFG.linear_conv_dim)
+#define DELTA_STATE_SIZE    (CFG.delta_state_size)
+#define ROPE_THETA          (CFG.rope_theta)
+#define PARTIAL_ROTARY      (CFG.partial_rotary)
+#define ROTARY_DIM          (CFG.rotary_dim)
+#define EXPERT_SIZE         (CFG.expert_size)
+#define GATE_W_OFF          (CFG.gate_w_off)
+#define GATE_S_OFF          (CFG.gate_s_off)
+#define GATE_B_OFF          (CFG.gate_b_off)
+#define UP_W_OFF            (CFG.up_w_off)
+#define UP_S_OFF            (CFG.up_s_off)
+#define UP_B_OFF            (CFG.up_b_off)
+#define DOWN_W_OFF          (CFG.down_w_off)
+#define DOWN_S_OFF          (CFG.down_s_off)
+#define DOWN_B_OFF          (CFG.down_b_off)
+#define EXPERT_SIZE_2BIT    (CFG.expert_size_2bit)
+#define GATE_W_OFF_2        (CFG.gate_w_off_2)
+#define GATE_S_OFF_2        (CFG.gate_s_off_2)
+#define GATE_B_OFF_2        (CFG.gate_b_off_2)
+#define UP_W_OFF_2          (CFG.up_w_off_2)
+#define UP_S_OFF_2          (CFG.up_s_off_2)
+#define UP_B_OFF_2          (CFG.up_b_off_2)
+#define DOWN_W_OFF_2        (CFG.down_w_off_2)
+#define DOWN_S_OFF_2        (CFG.down_s_off_2)
+#define DOWN_B_OFF_2        (CFG.down_b_off_2)
+#define NUM_FULL_ATTN_LAYERS (CFG.num_full_attn_layers)
+#define NUM_LINEAR_LAYERS    (CFG.num_linear_layers)
+
+#define MODEL_PATH_DEFAULT  "."
 
 // ============================================================================
 // Timing helper
@@ -199,7 +341,7 @@ typedef struct {
     uint32_t raw_size;
 } LZ4IndexEntry;
 
-static LZ4IndexEntry *g_lz4_index[NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
+static LZ4IndexEntry *g_lz4_index[MAX_LAYERS];  // per-layer index (NULL if not using LZ4)
 static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
@@ -207,7 +349,7 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 // Expert frequency tracking (diagnostic: --freq flag)
 // ============================================================================
 
-static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
+static int g_expert_freq[MAX_LAYERS][MAX_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
@@ -216,7 +358,7 @@ static float g_temperature = 0.0f; // 0 = greedy (argmax), >0 = temperature samp
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
-static uint8_t g_expert_seen[NUM_LAYERS][NUM_EXPERTS / 8];  // bitset: seen before?
+static uint8_t g_expert_seen[MAX_LAYERS][MAX_EXPERTS / 8];  // bitset: seen before?
 
 // Async pread state defined after InferPreadTask (see below)
 
@@ -256,9 +398,9 @@ typedef struct {
 } CacheTelemetry;
 
 static CacheTelemetry g_cache_telemetry = {0};
-static uint8_t g_cache_seen[NUM_LAYERS][NUM_EXPERTS];
-static uint64_t g_cache_last_touch_token[NUM_LAYERS][NUM_EXPERTS];
-static uint64_t g_cache_last_evict_token[NUM_LAYERS][NUM_EXPERTS];
+static uint8_t g_cache_seen[MAX_LAYERS][MAX_EXPERTS];
+static uint64_t g_cache_last_touch_token[MAX_LAYERS][MAX_EXPERTS];
+static uint64_t g_cache_last_evict_token[MAX_LAYERS][MAX_EXPERTS];
 
 static void cache_telemetry_reset(void) {
     memset(&g_cache_telemetry, 0, sizeof(g_cache_telemetry));
@@ -476,6 +618,86 @@ static TensorManifest *load_manifest(const char *json_path) {
 
         printf("[manifest] Loaded %d tensors from %s\n", m->num_tensors, json_path);
         return m;
+    }
+}
+
+// Load model config from model_weights.json "config" section into global CFG
+static int load_config_from_json(const char *json_path) {
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:json_path]];
+        if (!data) {
+            fprintf(stderr, "WARNING: Cannot read %s for config, using defaults\n", json_path);
+            return -1;
+        }
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data
+                                                             options:0
+                                                               error:&error];
+        if (!root) return -1;
+
+        NSDictionary *config = root[@"config"];
+        if (!config) {
+            fprintf(stderr, "WARNING: No 'config' section in manifest, using defaults\n");
+            return -1;
+        }
+
+        // Read all config fields (with fallback to defaults already in CFG)
+        if (config[@"hidden_size"])
+            CFG.hidden_dim = [config[@"hidden_size"] intValue];
+        if (config[@"num_hidden_layers"])
+            CFG.num_layers = [config[@"num_hidden_layers"] intValue];
+        if (config[@"num_attention_heads"])
+            CFG.num_attn_heads = [config[@"num_attention_heads"] intValue];
+        if (config[@"num_key_value_heads"])
+            CFG.num_kv_heads = [config[@"num_key_value_heads"] intValue];
+        if (config[@"head_dim"])
+            CFG.head_dim = [config[@"head_dim"] intValue];
+        if (config[@"vocab_size"])
+            CFG.vocab_size = [config[@"vocab_size"] intValue];
+        if (config[@"num_experts"])
+            CFG.num_experts = [config[@"num_experts"] intValue];
+        if (config[@"num_experts_per_tok"])
+            CFG.num_experts_per_tok = [config[@"num_experts_per_tok"] intValue];
+        if (config[@"moe_intermediate_size"])
+            CFG.moe_intermediate = [config[@"moe_intermediate_size"] intValue];
+        if (config[@"shared_expert_intermediate_size"])
+            CFG.shared_intermediate = [config[@"shared_expert_intermediate_size"] intValue];
+        if (config[@"full_attention_interval"])
+            CFG.full_attn_interval = [config[@"full_attention_interval"] intValue];
+        if (config[@"group_size"])
+            CFG.group_size = [config[@"group_size"] intValue];
+        if (config[@"bits"])
+            CFG.bits = [config[@"bits"] intValue];
+        if (config[@"linear_num_value_heads"])
+            CFG.linear_num_v_heads = [config[@"linear_num_value_heads"] intValue];
+        if (config[@"linear_num_key_heads"])
+            CFG.linear_num_k_heads = [config[@"linear_num_key_heads"] intValue];
+        if (config[@"linear_key_head_dim"])
+            CFG.linear_key_dim = [config[@"linear_key_head_dim"] intValue];
+        if (config[@"linear_value_head_dim"])
+            CFG.linear_value_dim = [config[@"linear_value_head_dim"] intValue];
+        if (config[@"rope_theta"])
+            CFG.rope_theta = [config[@"rope_theta"] floatValue];
+        if (config[@"partial_rotary_factor"])
+            CFG.partial_rotary = [config[@"partial_rotary_factor"] floatValue];
+        if (config[@"gate_bits"])
+            CFG.gate_bits = [config[@"gate_bits"] intValue];
+
+        // Recompute all derived values
+        config_compute_derived(&CFG);
+
+        printf("[config] Loaded: hidden=%d layers=%d heads=%d experts=%d topK=%d moe_int=%d gate_bits=%d\n",
+               CFG.hidden_dim, CFG.num_layers, CFG.num_attn_heads,
+               CFG.num_experts, CFG.num_experts_per_tok, CFG.moe_intermediate, CFG.gate_bits);
+        printf("[config] Linear attn: v_heads=%d k_heads=%d key_dim=%d val_dim=%d\n",
+               CFG.linear_num_v_heads, CFG.linear_num_k_heads,
+               CFG.linear_key_dim, CFG.linear_value_dim);
+        printf("[config] Expert sizes: 4-bit=%zu 2-bit=%zu\n",
+               CFG.expert_size, CFG.expert_size_2bit);
+
+        return 0;
     }
 }
 
@@ -788,6 +1010,19 @@ static void cpu_dequant_matvec_8bit(
     }
 }
 
+// Gate dequant dispatch: uses 8-bit or 4-bit based on CFG.gate_bits
+static void cpu_dequant_matvec_gate(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    if (CFG.gate_bits == 8) {
+        cpu_dequant_matvec_8bit(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    } else {
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
+}
+
 // RMS normalization: out = x * w / rms(x)
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
@@ -1023,7 +1258,6 @@ typedef struct {
     // Each expert k uses slot [k].
     // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
     // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
@@ -1042,9 +1276,8 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 10
-    id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
-    id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    id<MTLBuffer> buf_kv_k[MAX_FULL_ATTN_LAYERS];  // K cache per full-attn layer
+    id<MTLBuffer> buf_kv_v[MAX_FULL_ATTN_LAYERS];  // V cache per full-attn layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
@@ -1064,9 +1297,8 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 30
-    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
-    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
+    id<MTLBuffer> buf_delta_state[MAX_LINEAR_LAYERS];   // [v_heads*v_dim*k_dim] float per layer
+    id<MTLBuffer> buf_conv_state[MAX_LINEAR_LAYERS];    // [3*conv_dim] float per layer
     // Scratch buffers for delta-net inputs/outputs
     id<MTLBuffer> buf_delta_q;        // [2048] float
     id<MTLBuffer> buf_delta_k;        // [2048] float
@@ -2797,11 +3029,11 @@ static void moe_forward(
     }
 
     // Softmax routing scores
-    // gate and shared_expert_gate are 8-bit quantized; recompute on CPU
+    // gate and shared_expert_gate quantization depends on model (4-bit or 8-bit)
     if (gate_w && gate_s && gate_b)
-        cpu_dequant_matvec_8bit(gate_w, gate_s, gate_b, h_post, gate_scores, NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
+        cpu_dequant_matvec_gate(gate_w, gate_s, gate_b, h_post, gate_scores, NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
     if (seg_w && seg_s && seg_b)
-        cpu_dequant_matvec_8bit(seg_w, seg_s, seg_b, h_post, &shared_gate_score, 1, HIDDEN_DIM, GROUP_SIZE);
+        cpu_dequant_matvec_gate(seg_w, seg_s, seg_b, h_post, &shared_gate_score, 1, HIDDEN_DIM, GROUP_SIZE);
     cpu_softmax(gate_scores, NUM_EXPERTS);
 
     // Top-K expert selection
@@ -3309,7 +3541,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int entry_idx[MAX_LAYERS][MAX_EXPERTS];
     uint64_t access_counter; // monotonic, incremented on every access
     id<MTLDevice> device;    // for allocating new Metal buffers
     // Stats
@@ -3467,7 +3699,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int entry_idx[MAX_LAYERS][MAX_EXPERTS];
     uint64_t access_counter;
     uint64_t hits;
     uint64_t misses;
@@ -3771,7 +4003,7 @@ typedef struct {
     uint32_t *seg_w;  uint16_t *seg_s, *seg_b; // shared_expert_gate
 } LayerWeightCache;
 
-static LayerWeightCache layer_cache[NUM_LAYERS];
+static LayerWeightCache layer_cache[MAX_LAYERS];
 static int layer_cache_built = 0;
 
 static void build_layer_cache(WeightFile *wf) {
@@ -3913,7 +4145,7 @@ typedef struct {
     float expert_weights[MAX_K];        // routing weights for weighted accumulation
     int valid[MAX_K];                   // which experts loaded successfully
     int actual_K;                       // number of experts
-    float h_mid[HIDDEN_DIM];            // saved h_mid for final combine
+    float h_mid[MAX_HIDDEN_DIM];            // saved h_mid for final combine
     float shared_gate_score;            // saved shared expert gate score
     float *hidden;                      // pointer to hidden state (for writing final result)
     int layer_idx;                      // which layer produced this deferred state
@@ -4472,7 +4704,7 @@ static void fused_layer_forward(
         memset(spec_scores, 0, NUM_EXPERTS * sizeof(float));
 
         // Gate projection matvec on pre-attention normed input (CPU, ~0.1ms for 512x4096)
-        cpu_dequant_matvec_8bit(lc->gate_w, lc->gate_s, lc->gate_b,
+        cpu_dequant_matvec_gate(lc->gate_w, lc->gate_s, lc->gate_b,
                            normed, spec_scores,
                            NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
         cpu_softmax(spec_scores, NUM_EXPERTS);
@@ -5123,10 +5355,10 @@ static void fused_layer_forward(
 
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
-    // gate and shared_expert_gate are 8-bit quantized; recompute on CPU with correct unpacking
-    cpu_dequant_matvec_8bit(lc->gate_w, lc->gate_s, lc->gate_b,
+    // gate and shared_expert_gate quantization depends on model (4-bit or 8-bit)
+    cpu_dequant_matvec_gate(lc->gate_w, lc->gate_s, lc->gate_b,
                             h_post, gate_scores, NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
-    cpu_dequant_matvec_8bit(lc->seg_w, lc->seg_s, lc->seg_b,
+    cpu_dequant_matvec_gate(lc->seg_w, lc->seg_s, lc->seg_b,
                             h_post, &shared_gate_score, 1, HIDDEN_DIM, GROUP_SIZE);
     cpu_softmax(gate_scores, NUM_EXPERTS);
     int expert_indices[64];
@@ -7626,6 +7858,32 @@ int main(int argc, char **argv) {
             vocab_path = default_vocab;
         }
 
+        // ---- Load model config from manifest ----
+        config_set_defaults(&CFG);
+        if (load_config_from_json(manifest_path) == 0) {
+            printf("[config] Model config loaded from %s\n", manifest_path);
+        } else {
+            printf("[config] Using default config (397B)\n");
+        }
+        strncpy(CFG.model_path, model_path, sizeof(CFG.model_path) - 1);
+
+        // Validate config against array bounds
+        if (CFG.num_full_attn_layers > MAX_FULL_ATTN_LAYERS) {
+            fprintf(stderr, "ERROR: num_full_attn_layers=%d exceeds MAX=%d\n",
+                    CFG.num_full_attn_layers, MAX_FULL_ATTN_LAYERS);
+            return 1;
+        }
+        if (CFG.num_linear_layers > MAX_LINEAR_LAYERS) {
+            fprintf(stderr, "ERROR: num_linear_layers=%d exceeds MAX=%d\n",
+                    CFG.num_linear_layers, MAX_LINEAR_LAYERS);
+            return 1;
+        }
+        if (CFG.num_experts_per_tok > MAX_K) {
+            fprintf(stderr, "ERROR: num_experts_per_tok=%d exceeds MAX_K=%d\n",
+                    CFG.num_experts_per_tok, MAX_K);
+            return 1;
+        }
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
@@ -7646,8 +7904,9 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.6-35B-A3B Metal Inference Engine ===\n");
-        printf("Model:    %s\n", model_path);
+        printf("=== Flash-MoE Inference Engine ===\n");
+        printf("Model:    %s (hidden=%d layers=%d experts=%d topK=%d)\n",
+               model_path, CFG.hidden_dim, CFG.num_layers, CFG.num_experts, CFG.num_experts_per_tok);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);

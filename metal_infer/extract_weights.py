@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-extract_weights.py — Extract all non-expert weights from Qwen3.6-35B-A3B-4bit
+extract_weights.py — Extract all non-expert weights from a Qwen3.x-MoE model
 into a single binary file that the C inference engine can mmap.
+
+Supports: Qwen3.5-397B-A17B, Qwen3.5-122B-A10B, Qwen3.6-35B-A3B (and similar).
+Model architecture is auto-detected from config.json in the model directory.
 
 Outputs:
   - model_weights.bin: binary blob containing all non-expert weight tensors
@@ -13,7 +16,7 @@ The binary format is simple:
   - The JSON manifest maps tensor names to {offset, size, shape, dtype}
 
 Usage:
-    python extract_weights.py [--model PATH] [--output DIR]
+    python extract_weights.py --model PATH [--output DIR]
 """
 
 import json
@@ -39,10 +42,8 @@ def parse_safetensors_header(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
-    parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit'),
-                        help='Path to model directory')
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to model directory (e.g. Qwen3.5-122B-A10B-4bit)')
     parser.add_argument('--output', type=str, default='.',
                         help='Output directory for model_weights.bin and .json')
     parser.add_argument('--include-experts', action='store_true',
@@ -116,38 +117,103 @@ def main():
 
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
+
+    # Auto-detect model config from config.json
+    config_json_path = model_path / 'config.json'
+    if not config_json_path.exists():
+        print(f"ERROR: {config_json_path} not found — cannot auto-detect model architecture", file=sys.stderr)
+        sys.exit(1)
+
+    with open(config_json_path) as f:
+        model_cfg = json.load(f)
+
+    # Extract architecture parameters (works for Qwen3.5/3.6 MoE models)
+    hidden_size = model_cfg.get('hidden_size', 4096)
+    num_layers = model_cfg.get('num_hidden_layers', 60)
+    num_attn_heads = model_cfg.get('num_attention_heads', 32)
+    num_kv_heads = model_cfg.get('num_key_value_heads', 2)
+    head_dim = model_cfg.get('head_dim', 256)
+    vocab_size = model_cfg.get('vocab_size', 248320)
+    num_experts = model_cfg.get('num_experts', 512)
+    num_experts_per_tok = model_cfg.get('num_experts_per_tok', 10)
+    moe_intermediate = model_cfg.get('moe_intermediate_size', 1024)
+    shared_intermediate = model_cfg.get('shared_expert_intermediate_size', moe_intermediate)
+    full_attn_interval = model_cfg.get('full_attention_interval', 4)
+    rope_theta = model_cfg.get('rope_theta', 10000000.0)
+    partial_rotary = model_cfg.get('partial_rotary_factor', 0.25)
+
+    # Linear attention (GatedDeltaNet) params — may be in sub-config
+    linear_cfg = model_cfg.get('linear_attn_config', model_cfg)
+    linear_num_v_heads = linear_cfg.get('num_value_heads', linear_cfg.get('linear_num_value_heads', 64))
+    linear_num_k_heads = linear_cfg.get('num_key_heads', linear_cfg.get('linear_num_key_heads', 16))
+    linear_key_dim = linear_cfg.get('key_head_dim', linear_cfg.get('linear_key_head_dim', 128))
+    linear_value_dim = linear_cfg.get('value_head_dim', linear_cfg.get('linear_value_head_dim', 128))
+    linear_conv_kernel = linear_cfg.get('conv_kernel_dim', linear_cfg.get('linear_conv_kernel_dim', 4))
+
+    # Detect gate quantization bits from actual tensor data
+    # Look for a gate tensor and check its packing
+    gate_bits = 4  # default
+    for name, filename in weight_map.items():
+        if '.mlp.gate.' in name and name.endswith('.weight'):
+            filepath = model_path / filename
+            header, _ = header_cache.get(filename, parse_safetensors_header(str(filepath)))
+            if name in header:
+                gate_meta = header[name]
+                gate_shape = gate_meta['shape']
+                gate_offsets = gate_meta['data_offsets']
+                gate_bytes = gate_offsets[1] - gate_offsets[0]
+                # For U32 packed: 4-bit packs 8 values per U32, 8-bit packs 4 values per U32
+                if len(gate_shape) == 2:
+                    expected_4bit = gate_shape[0] * gate_shape[1] * 4  # U32 count * 4 bytes
+                    elements = gate_shape[0] * gate_shape[1]  # actual packed elements
+                    # 4-bit: elements = out * in/8, 8-bit: elements = out * in/4
+                    # If actual bytes = num_experts * (hidden/4) * 4, it's 8-bit
+                    expected_8bit_u32 = num_experts * (hidden_size // 4)
+                    expected_4bit_u32 = num_experts * (hidden_size // 8)
+                    if gate_shape[1] == hidden_size // 4:
+                        gate_bits = 8
+                    elif gate_shape[1] == hidden_size // 8:
+                        gate_bits = 4
+            break
+
+    print(f"\nAuto-detected model config:")
+    print(f"  hidden_size={hidden_size}, num_layers={num_layers}, heads={num_attn_heads}")
+    print(f"  experts={num_experts}, topK={num_experts_per_tok}, moe_int={moe_intermediate}")
+    print(f"  linear: v_heads={linear_num_v_heads}, k_heads={linear_num_k_heads}")
+    print(f"  gate_bits={gate_bits}")
+
     manifest = {
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
         "config": {
-            "hidden_size": 2048,
-            "num_hidden_layers": 40,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
+            "hidden_size": hidden_size,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": num_attn_heads,
+            "num_key_value_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "vocab_size": vocab_size,
             "rms_norm_eps": 1e-6,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "moe_intermediate_size": 512,
-            "shared_expert_intermediate_size": 512,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 32,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
+            "num_experts": num_experts,
+            "num_experts_per_tok": num_experts_per_tok,
+            "moe_intermediate_size": moe_intermediate,
+            "shared_expert_intermediate_size": shared_intermediate,
+            "full_attention_interval": full_attn_interval,
+            "linear_num_value_heads": linear_num_v_heads,
+            "linear_num_key_heads": linear_num_k_heads,
+            "linear_key_head_dim": linear_key_dim,
+            "linear_value_head_dim": linear_value_dim,
+            "linear_conv_kernel_dim": linear_conv_kernel,
+            "partial_rotary_factor": partial_rotary,
+            "rope_theta": rope_theta,
+            "gate_bits": gate_bits,
         }
     }
 
     # Layer type map
     layer_types = []
-    for i in range(40):
-        if (i + 1) % 4 == 0:
+    for i in range(num_layers):
+        if (i + 1) % full_attn_interval == 0:
             layer_types.append("full_attention")
         else:
             layer_types.append("linear_attention")

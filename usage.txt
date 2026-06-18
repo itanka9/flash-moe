@@ -1,66 +1,70 @@
-Flash-MoE: Qwen3.6-35B-A3B Usage
+Flash-MoE: Universal Qwen3.x-MoE Usage
 ================================================================================
-Model: ~/.cache/modelscope/hub/models/mlx-community/Qwen3___6-35B-A3B-4bit
-       (symlinked as metal_infer/Qwen3.6-35B-A3B-4bit)
+Supported models: Qwen3.5-397B-A17B, Qwen3.5-122B-A10B, Qwen3.6-35B-A3B
+                  (any Qwen3.x MoE with GatedDeltaNet + full attention)
+
+Model directory: the 4-bit quantized model (e.g. mlx-community/Qwen3.5-122B-A10B-4bit)
 
 STEP 1 — Generate expert index
 ================================================================================
-    cd /Users/dan/LLM/flash-moe
-    python generate_expert_index.py
+    cd /path/to/flash-moe
+    python generate_expert_index.py --model /path/to/Qwen3.x-Model-4bit
 
     Output: expert_index.json written into the model directory (~1MB, fast)
 
 STEP 2 — Extract non-expert weights
 ================================================================================
-    cd /Users/dan/LLM/flash-moe/metal_infer
-    python extract_weights.py --model ../Qwen3.6-35B-A3B-4bit --output .
+    cd /path/to/flash-moe/metal_infer
+    python extract_weights.py --model /path/to/Qwen3.x-Model-4bit --output .
 
-    Outputs: model_weights.bin (~1.5GB), model_weights.json
+    Outputs: model_weights.bin (non-expert weights), model_weights.json (manifest + config)
+    The model config (hidden_size, num_layers, etc.) is auto-detected from config.json.
 
 STEP 3 — Export tokenizer and vocab
 ================================================================================
-    cd /Users/dan/LLM/flash-moe/metal_infer
+    cd /path/to/flash-moe/metal_infer
     python export_tokenizer.py \
-        Qwen3.6-35B-A3B-4bit/tokenizer.json \
+        /path/to/Qwen3.x-Model-4bit/tokenizer.json \
         tokenizer.bin
     python export_vocab.py \
-        Qwen3.6-35B-A3B-4bit/tokenizer.json \
+        /path/to/Qwen3.x-Model-4bit/tokenizer.json \
         vocab.bin
 
     Outputs: tokenizer.bin (~20MB, BPE encoder), vocab.bin (~3MB, token id->string decoder)
 
 STEP 4 — Repack expert weights (4-bit)
 ================================================================================
-    cd /Users/dan/LLM/flash-moe
-    python repack_experts.py --dry-run    # verify first
-    python repack_experts.py              # write ~18 GB to packed_experts/
+    cd /path/to/flash-moe
+    python repack_experts.py --index /path/to/Qwen3.x-Model-4bit/expert_index.json --dry-run
+    python repack_experts.py --index /path/to/Qwen3.x-Model-4bit/expert_index.json
 
     Options:
       --layers 0-4       repack only layers 0-4
       --layers 0,5,10    repack specific layers
       --verify-only 0    verify layer 0 against originals
 
-    Layout: 40 layers × 256 experts × 1,769,472 bytes = ~452 MB per layer
+    Layout is auto-detected from expert_index.json.
 
 STEP 4b — Repack expert weights to 2-bit (optional, faster but lower quality)
 ================================================================================
-    cd /Users/dan/LLM/flash-moe
+    cd /path/to/flash-moe
 
     # Test a single layer first (with verification)
     python metal_infer/repack_experts_2bit.py --layer 0 --verify
 
-    # Repack all 40 layers (~10 GB output, vs ~18 GB for 4-bit)
+    # Repack all layers
     python metal_infer/repack_experts_2bit.py
-
-    Output: packed_experts_2bit/layer_XX.bin (983,040 bytes per expert × 256 experts)
 
     Note: 2-bit mode is faster but breaks JSON/tool calling (produces \name\ instead of
     "name"). Use 4-bit for production; 2-bit for speed experiments only.
 
 STEP 5 — Build
 ================================================================================
-    cd /Users/dan/LLM/flash-moe/metal_infer
+    cd /path/to/flash-moe/metal_infer
     make clean && make
+
+    No recompilation needed when switching models — the binary reads model config
+    from model_weights.json at runtime.
 
 STEP 6 — Inference
 ================================================================================
@@ -70,14 +74,11 @@ STEP 6 — Inference
     # With per-layer timing
     ./infer --prompt "Hello" --tokens 20 --timing
 
-    # More active experts (default K=8, max K=8 for 35B)
-    ./infer --prompt "Write a haiku" --tokens 50 --k 8
-
     # 2-bit mode (faster, breaks tool calling / JSON — requires Step 4b)
     ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
 
     # Interactive chat with tool calling
     ./chat
 
-    # Custom model path
+    # Custom model path (all paths auto-discovered)
     ./infer --model /path/to/model --prompt "Hello" --tokens 50
