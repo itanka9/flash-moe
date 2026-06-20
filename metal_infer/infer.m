@@ -6052,6 +6052,179 @@ static char *extract_last_content(char *buf) {
     return last;
 }
 
+// Extract the content of the last role:"user" message from the messages array.
+// Handles both formats:
+//   "content": "string"                         (simple)
+//   "content": [{"type":"text","text":"..."}]   (multimodal/Zed)
+// Returns malloc'd concatenated string; caller frees. NULL if not found.
+static char *extract_last_user_content(char *buf) {
+    // Find the messages array
+    char *msgs = strstr(buf, "\"messages\"");
+    if (!msgs) return NULL;
+    msgs = strchr(msgs, '[');
+    if (!msgs) return NULL;
+    char *end = buf + strlen(buf);
+    msgs++; // skip '['
+
+    char *last_user_obj_start = NULL;
+    char *last_user_obj_end = NULL;
+
+    // Walk through message objects looking for role:"user" messages
+    char *p = msgs;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+
+        // Find the matching closing brace for this message object
+        char *obj_start = p;
+        int depth = 0, in_str = 0;
+        while (p < end) {
+            if (in_str) {
+                if (*p == '\\') { p++; if (p < end) p++; continue; }
+                if (*p == '"') in_str = 0;
+            } else {
+                if (*p == '"') in_str = 1;
+                else if (*p == '{' || *p == '[') depth++;
+                else if (*p == '}' || *p == ']') { if (--depth == 0) { p++; break; } }
+            }
+            p++;
+        }
+        char *obj_end = p;
+
+        // Check if this message has role:"user"
+        char *role_p = strstr(obj_start, "\"role\"");
+        if (!role_p || role_p >= obj_end) continue;
+        char *rv = role_p + 6;
+        while (*rv == ' ' || *rv == ':' || *rv == '\t') rv++;
+        if (*rv != '"') continue;
+        rv++;
+        if (strncmp(rv, "user\"", 5) != 0) continue;
+
+        last_user_obj_start = obj_start;
+        last_user_obj_end = obj_end;
+    }
+
+    if (!last_user_obj_start) return NULL;
+
+    // Find the content field in the last user message
+    char *cp = strstr(last_user_obj_start, "\"content\"");
+    if (!cp || cp >= last_user_obj_end) return NULL;
+    cp += 9; // skip "content"
+    while (*cp == ' ' || *cp == '\t' || *cp == ':') cp++;
+
+    if (*cp == '"') {
+        // Simple string content: "content": "text..."
+        cp++; // skip opening quote
+        char *ce = cp;
+        while (*ce && !(*ce == '"' && (ce == cp || *(ce-1) != '\\'))) ce++;
+        size_t len = (size_t)(ce - cp);
+        char *result = malloc(len + 1);
+        if (!result) return NULL;
+        // Unescape
+        char *r = cp, *w = result;
+        while (r < ce) {
+            if (*r == '\\' && r + 1 < ce) {
+                r++;
+                switch (*r) {
+                    case 'n':  *w++ = '\n'; r++; break;
+                    case 't':  *w++ = '\t'; r++; break;
+                    case '"':  *w++ = '"';  r++; break;
+                    case '\\': *w++ = '\\'; r++; break;
+                    default:   *w++ = '\\'; *w++ = *r++; break;
+                }
+            } else {
+                *w++ = *r++;
+            }
+        }
+        *w = '\0';
+        return result;
+    } else if (*cp == '[') {
+        // Array content: "content": [{"type":"text","text":"..."}, ...]
+        // Concatenate all "text" fields from content parts
+        size_t cap = 4096, len = 0;
+        char *result = malloc(cap);
+        if (!result) return NULL;
+        result[0] = '\0';
+
+        char *ap = cp + 1; // skip '['
+        while (ap < last_user_obj_end) {
+            while (ap < last_user_obj_end && (*ap == ' ' || *ap == '\t' || *ap == '\n' || *ap == '\r' || *ap == ',')) ap++;
+            if (*ap == ']') break;
+            if (*ap != '{') break;
+
+            // Find end of this content part object
+            char *part_start = ap;
+            int d2 = 0, in_s2 = 0;
+            while (ap < last_user_obj_end) {
+                if (in_s2) {
+                    if (*ap == '\\') { ap++; if (ap < last_user_obj_end) ap++; continue; }
+                    if (*ap == '"') in_s2 = 0;
+                } else {
+                    if (*ap == '"') in_s2 = 1;
+                    else if (*ap == '{' || *ap == '[') d2++;
+                    else if (*ap == '}' || *ap == ']') { if (--d2 == 0) { ap++; break; } }
+                }
+                ap++;
+            }
+            char *part_end = ap;
+
+            // Find "text" field in this part (skip "type" field)
+            char *tp = part_start;
+            while (tp < part_end) {
+                tp = strstr(tp, "\"text\"");
+                if (!tp || tp >= part_end) break;
+                // Make sure this is the "text" key, not "type":"text"
+                // Check: preceded by comma, brace, or whitespace (not colon which would make it a value)
+                char *before = tp - 1;
+                while (before > part_start && (*before == ' ' || *before == '\t')) before--;
+                if (before > part_start && *before == ':') {
+                    // This "text" is a value (e.g. "type":"text"), skip it
+                    tp += 6;
+                    continue;
+                }
+                // This is the "text" key — extract its value
+                tp += 6; // skip "text"
+                while (tp < part_end && (*tp == ' ' || *tp == '\t' || *tp == ':')) tp++;
+                if (tp >= part_end || *tp != '"') break;
+                tp++; // skip opening quote
+                // Find closing quote
+                char *te = tp;
+                while (te < part_end && !(*te == '"' && *(te-1) != '\\')) te++;
+                // Unescape and append to result
+                char *r = tp;
+                while (r < te) {
+                    if (len + 4 >= cap) {
+                        cap *= 2;
+                        char *nb = realloc(result, cap);
+                        if (!nb) { free(result); return NULL; }
+                        result = nb;
+                    }
+                    if (*r == '\\' && r + 1 < te) {
+                        r++;
+                        switch (*r) {
+                            case 'n':  result[len++] = '\n'; r++; break;
+                            case 't':  result[len++] = '\t'; r++; break;
+                            case '"':  result[len++] = '"';  r++; break;
+                            case '\\': result[len++] = '\\'; r++; break;
+                            default:   result[len++] = '\\'; result[len++] = *r++; break;
+                        }
+                    } else {
+                        result[len++] = *r++;
+                    }
+                }
+                break; // done with this part's text
+            }
+        }
+        result[len] = '\0';
+        if (len == 0) { free(result); return NULL; }
+        return result;
+    } else if (strncmp(cp, "null", 4) == 0) {
+        return NULL;
+    }
+    return NULL;
+}
+
 // Extract "max_tokens" or "max_completion_tokens" from JSON body. Returns value or default.
 static int extract_max_tokens(const char *buf, int default_val) {
     const char *p = strstr(buf, "\"max_completion_tokens\"");
@@ -6677,6 +6850,91 @@ static int has_prior_assistant_message(const char *body) {
     return 0;
 }
 
+// Detect if any message has role:"user".
+static int has_user_message(const char *body) {
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == '"') { p++; if (strncmp(p, "user\"", 5) == 0) return 1; }
+    }
+    return 0;
+}
+
+// Extract the content of the first role:"system" message from the request body.
+// Returns malloc'd unescaped string; caller frees. NULL if not found.
+static char *extract_system_content(const char *body) {
+    const char *p = body;
+    // Find "messages" array
+    p = strstr(p, "\"messages\"");
+    if (!p) return NULL;
+    p = strchr(p, '[');
+    if (!p) return NULL;
+    const char *body_end = body + strlen(body);
+    p++; // skip '['
+
+    while (p < body_end) {
+        while (p < body_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+        // Find the matching closing brace for this message object
+        const char *obj_start = p;
+        int depth = 0, in_str = 0;
+        while (p < body_end) {
+            if (in_str) {
+                if (*p == '\\') { p++; if (p < body_end) p++; continue; }
+                if (*p == '"') in_str = 0;
+            } else {
+                if (*p == '"') in_str = 1;
+                else if (*p == '{' || *p == '[') depth++;
+                else if (*p == '}' || *p == ']') { if (--depth == 0) { p++; break; } }
+            }
+            p++;
+        }
+        // Check if this message has role:"system"
+        const char *role_p = strstr(obj_start, "\"role\"");
+        if (!role_p || role_p >= p) continue;
+        const char *rv = role_p + 6;
+        while (*rv == ' ' || *rv == ':' || *rv == '\t') rv++;
+        if (*rv != '"') continue;
+        rv++;
+        if (strncmp(rv, "system\"", 7) != 0) continue;
+        // Found system message — extract content
+        const char *cp = strstr(obj_start, "\"content\"");
+        if (!cp || cp >= p) continue;
+        cp += 9;
+        while (*cp == ' ' || *cp == ':' || *cp == '\t') cp++;
+        if (*cp != '"') continue;
+        cp++; // skip opening quote
+        // Find end of string (handle escapes)
+        const char *end = cp;
+        while (end < p && !(*end == '"' && *(end-1) != '\\')) end++;
+        size_t len = (size_t)(end - cp);
+        char *result = malloc(len + 1);
+        if (!result) return NULL;
+        // Unescape inline
+        char *w = result;
+        const char *r = cp;
+        while (r < end) {
+            if (*r == '\\' && r + 1 < end) {
+                r++;
+                switch (*r) {
+                    case 'n':  *w++ = '\n'; r++; break;
+                    case 't':  *w++ = '\t'; r++; break;
+                    case '"':  *w++ = '"';  r++; break;
+                    case '\\': *w++ = '\\'; r++; break;
+                    default:   *w++ = '\\'; *w++ = *r++; break;
+                }
+            } else {
+                *w++ = *r++;
+            }
+        }
+        *w = '\0';
+        return result;
+    }
+    return NULL;
+}
+
 // Dynamic string builder helper — appends s (slen bytes, or strlen if -1) to *buf.
 // Grows *buf via realloc. Returns 1 on success, 0 on alloc failure.
 static int sb_append(char **buf, size_t *len, size_t *cap, const char *s, int slen) {
@@ -7107,6 +7365,53 @@ static void serve_loop(
             }
             body += 4;
 
+            // Log full request for debugging
+            int body_len = (int)strlen(body);
+            fprintf(stderr, "\n[serve] === NEW REQUEST (%d bytes) ===\n", body_len);
+            if (body_len <= 200000) {
+                fprintf(stderr, "%s\n", body);
+            } else {
+                fprintf(stderr, "%.1000s\n...(%d bytes omitted)...\n%.500s\n",
+                        body, body_len - 1500, body + body_len - 500);
+            }
+            fprintf(stderr, "[serve] has_user_message=%d\n", has_user_message(body));
+
+            // Reject requests with no user message (e.g. system-prompt-only warmup)
+            if (!has_user_message(body)) {
+                fprintf(stderr, "[serve] no user message — returning empty response\n");
+                // Detect stream preference
+                int warmup_stream = 1;
+                const char *ws_p = strstr(body, "\"stream\"");
+                if (ws_p) {
+                    ws_p += 8;
+                    while (*ws_p == ' ' || *ws_p == '\t' || *ws_p == ':') ws_p++;
+                    if (strncmp(ws_p, "false", 5) == 0) warmup_stream = 0;
+                }
+                char warmup_id[64];
+                snprintf(warmup_id, sizeof(warmup_id), "chatcmpl-%llu", ++req_counter);
+                if (warmup_stream) {
+                    http_write_str(client_fd, SSE_HEADERS);
+                    char chunk[512];
+                    int n = snprintf(chunk, sizeof(chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+                        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n", warmup_id);
+                    http_write(client_fd, chunk, n);
+                } else {
+                    char resp[512];
+                    int n = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],"
+                        "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n",
+                        warmup_id);
+                    http_write(client_fd, resp, n);
+                }
+                free(reqbuf); close(client_fd); continue;
+            }
+
             // Extract stream flag (default true for SSE compatibility)
             int do_stream = 1;
             const char *stream_p = strstr(body, "\"stream\"");
@@ -7152,6 +7457,9 @@ static void serve_loop(
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
 
+            // Extract system prompt from request BEFORE body mutation
+            char *req_system_prompt = extract_system_content(body);
+
             // Detect multi-turn BEFORE extract_last_content mutates body.
             // need_multiturn: messages has prior history we must replay into the prompt.
             int is_tool_result  = has_tool_result_message(body);
@@ -7176,23 +7484,54 @@ static void serve_loop(
             if (need_multiturn) {
                 static char *g_base_sys_mt = NULL;
                 if (!g_base_sys_mt) g_base_sys_mt = load_system_prompt();
-                const char *the_sys = g_base_sys_mt;
+                // Use system prompt from request if available
+                const char *base_sys_mt = (req_system_prompt && strlen(req_system_prompt) > 0) ? req_system_prompt : g_base_sys_mt;
+                const char *the_sys = base_sys_mt;
                 if (has_tools) {
                     tools_sys_prompt = build_system_prompt_with_tools(
-                        g_base_sys_mt, tools_json_start, tools_json_len);
+                        base_sys_mt, tools_json_start, tools_json_len);
                     if (tools_sys_prompt) the_sys = tools_sys_prompt;
                 }
                 multiturn_prompt_str = build_multiturn_prompt(body, the_sys);
             }
 
-            // Extract user content from messages (mutates body — must be last)
-            char *content = extract_last_content(body);
+            // Extract user content from last user message (malloc'd; caller frees)
+            char *content = extract_last_user_content(body);
             if (!content || strlen(content) == 0) {
-                http_write_str(client_fd,
-                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
-                    "{\"error\":\"no content in messages\"}\n");
+                // No user content — return empty response (Zed warmup/init request)
+                fprintf(stderr, "[serve] no user content in messages — returning empty response\n");
+                int warmup_stream2 = 1;
+                const char *ws2 = strstr(body, "\"stream\"");
+                if (ws2) {
+                    ws2 += 8;
+                    while (*ws2 == ' ' || *ws2 == '\t' || *ws2 == ':') ws2++;
+                    if (strncmp(ws2, "false", 5) == 0) warmup_stream2 = 0;
+                }
+                char warmup_id2[64];
+                snprintf(warmup_id2, sizeof(warmup_id2), "chatcmpl-%llu", ++req_counter);
+                if (warmup_stream2) {
+                    http_write_str(client_fd, SSE_HEADERS);
+                    char chunk[512];
+                    int n = snprintf(chunk, sizeof(chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+                        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n", warmup_id2);
+                    http_write(client_fd, chunk, n);
+                } else {
+                    char resp[512];
+                    int n = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],"
+                        "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n",
+                        warmup_id2);
+                    http_write(client_fd, resp, n);
+                }
                 if (multiturn_prompt_str) free(multiturn_prompt_str);
                 if (tools_sys_prompt) free(tools_sys_prompt);
+                if (req_system_prompt) free(req_system_prompt);
                 free(reqbuf); close(client_fd); continue;
             }
 
@@ -7206,7 +7545,9 @@ static void serve_loop(
                     is_auto_continuation ? "(auto)" : "",
                     has_session ? req_session_id : "(none)",
                     is_continuation ? " [CONTINUE]" : " [NEW]");
-            fprintf(stderr, "[serve] %s request body: %.500s\n", request_id, body);
+            fprintf(stderr, "[serve] %s need_multiturn=%d, do_full_prefill=%d, is_continuation=%d\n",
+                    request_id, need_multiturn, has_tools || need_multiturn, is_continuation);
+            fprintf(stderr, "[serve] %s user_content (first 200): %.200s\n", request_id, content);
 
             // ---- Tokenize ----
             // need_multiturn: build full Qwen3.5 chat template from messages array
@@ -7216,8 +7557,11 @@ static void serve_loop(
             int do_full_prefill = need_multiturn || has_tools;
             PromptTokens *pt;
             if (is_continuation && !do_full_prefill) {
+                fprintf(stderr, "[serve] %s tokenize path: CONTINUATION\n", request_id);
                 pt = tokenize_continuation_turn(content);
             } else if (need_multiturn) {
+                fprintf(stderr, "[serve] %s tokenize path: MULTITURN (prompt len=%zu)\n",
+                        request_id, multiturn_prompt_str ? strlen(multiturn_prompt_str) : 0);
                 if (!multiturn_prompt_str) {
                     http_write_str(client_fd,
                         "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
@@ -7230,10 +7574,17 @@ static void serve_loop(
                 multiturn_prompt_str = NULL;
             } else if (has_tools) {
                 // Single first-turn tool request (no prior assistant turns)
+                // Use system prompt from request if available, fallback to server default
+                fprintf(stderr, "[serve] %s tokenize path: TOOLS (first turn)\n", request_id);
                 static char *g_base_sys = NULL;
                 if (!g_base_sys) g_base_sys = load_system_prompt();
+                const char *base_sys = (req_system_prompt && strlen(req_system_prompt) > 0) ? req_system_prompt : g_base_sys;
+                fprintf(stderr, "[serve] %s system prompt source: %s (%zu chars)\n",
+                        request_id,
+                        (req_system_prompt && strlen(req_system_prompt) > 0) ? "request" : "server-default",
+                        strlen(base_sys));
                 tools_sys_prompt = build_system_prompt_with_tools(
-                    g_base_sys, tools_json_start, tools_json_len);
+                    base_sys, tools_json_start, tools_json_len);
                 if (!tools_sys_prompt) {
                     http_write_str(client_fd,
                         "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
@@ -7242,6 +7593,7 @@ static void serve_loop(
                 }
                 pt = tokenize_chat_message_with_tools(content, tools_sys_prompt);
             } else {
+                fprintf(stderr, "[serve] %s tokenize path: PLAIN (user turn only)\n", request_id);
                 pt = tokenize_user_turn(content);
             }
             if (!pt) {
@@ -7249,6 +7601,8 @@ static void serve_loop(
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
                 if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
+                if (req_system_prompt) { free(req_system_prompt); req_system_prompt = NULL; }
+                if (content) { free(content); content = NULL; }
                 free(reqbuf); close(client_fd); continue;
             }
 
@@ -7677,6 +8031,8 @@ static void serve_loop(
             // ---- Save session state ----
             g_temperature = saved_temperature;
             if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
+            if (req_system_prompt) { free(req_system_prompt); req_system_prompt = NULL; }
+            if (content) { free(content); content = NULL; }
             // Store last generated content for auto-continuation on next stateless request.
             // Invalidate if the KV cache contains a tool-augmented system prompt (different prefix).
             if (g_last_assistant_content) { free(g_last_assistant_content); g_last_assistant_content = NULL; }

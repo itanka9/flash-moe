@@ -403,7 +403,7 @@ def main():
         description='Requantize 4-bit packed experts to 2-bit')
     parser.add_argument('--model', type=str,
                         default=os.path.expanduser(
-                            '/Users/dan/LLM/flash-moe/metal_infer/Qwen3.6-35B-A3B-4bit'),
+                            '/Users/m/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46'),
                         help='Path to model directory (containing packed_experts/)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory (default: MODEL/packed_experts_2bit)')
