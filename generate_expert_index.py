@@ -89,20 +89,16 @@ def main():
     if os.path.exists(config_path):
         with open(config_path) as f:
             model_cfg = json.load(f)
-        NUM_LAYERS = model_cfg.get("num_hidden_layers", 60)
-        NUM_EXPERTS = model_cfg.get("num_experts", 512)
+        text_config = model_cfg.get("text_config", {})
+        NUM_LAYERS = text_config.get("num_hidden_layers")
+        NUM_EXPERTS = text_config.get("num_experts")
     else:
-        # Fallback: detect from weight_map keys
-        import re
-        layer_nums = set()
-        for name in weight_map:
-            m = re.match(r'language_model\.model\.layers\.(\d+)\.', name)
-            if m:
-                layer_nums.add(int(m.group(1)))
-        NUM_LAYERS = max(layer_nums) + 1 if layer_nums else 60
-        # Detect experts from tensor shapes
-        NUM_EXPERTS = 512  # fallback
-        print(f"WARNING: config.json not found, auto-detected {NUM_LAYERS} layers")
+        print(f"ERROR: {config_path} not found, exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    if NUM_LAYERS is None or NUM_EXPERTS is None:
+        print(f"ERROR: Could not detect NUM_LAYERS or NUM_EXPERTS from {config_path}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Model: {model_path}")
     print(f"Layers: {NUM_LAYERS}, Experts: {NUM_EXPERTS}")
