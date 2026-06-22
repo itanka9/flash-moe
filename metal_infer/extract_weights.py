@@ -140,41 +140,27 @@ def main():
     moe_intermediate = text_cfg.get('moe_intermediate_size', 1024)
     shared_intermediate = text_cfg.get('shared_expert_intermediate_size', moe_intermediate)
     full_attn_interval = text_cfg.get('full_attention_interval', 4)
-    rope_theta = text_cfg.get('rope_theta', 10000000.0)
-    partial_rotary = text_cfg.get('partial_rotary_factor', 0.25)
 
-    # Linear attention (GatedDeltaNet) params — may be in sub-config
-    linear_cfg = model_cfg.get('linear_attn_config', model_cfg)
-    linear_num_v_heads = linear_cfg.get('num_value_heads', text_cfg.get('linear_num_value_heads', 64))
-    linear_num_k_heads = linear_cfg.get('num_key_heads', text_cfg.get('linear_num_key_heads', 16))
-    linear_key_dim = linear_cfg.get('key_head_dim', text_cfg.get('linear_key_head_dim', 128))
-    linear_value_dim = linear_cfg.get('value_head_dim', text_cfg.get('linear_value_head_dim', 128))
-    linear_conv_kernel = linear_cfg.get('conv_kernel_dim', text_cfg.get('linear_conv_kernel_dim', 4))
+    # RoPE params: may be in text_config directly or nested in rope_parameters
+    rope_params = text_cfg.get('rope_parameters', {})
+    rope_theta = text_cfg.get('rope_theta', rope_params.get('rope_theta', 10000000.0))
+    partial_rotary = text_cfg.get('partial_rotary_factor',
+                                  rope_params.get('partial_rotary_factor', 0.25))
 
-    # Detect gate quantization bits from actual tensor data
-    # Look for a gate tensor and check its packing
-    gate_bits = 4  # default
-    for name, filename in weight_map.items():
-        if '.mlp.gate.' in name and name.endswith('.weight'):
-            filepath = model_path / filename
-            header, _ = header_cache.get(filename, parse_safetensors_header(str(filepath)))
-            if name in header:
-                gate_meta = header[name]
-                gate_shape = gate_meta['shape']
-                gate_offsets = gate_meta['data_offsets']
-                gate_bytes = gate_offsets[1] - gate_offsets[0]
-                # For U32 packed: 4-bit packs 8 values per U32, 8-bit packs 4 values per U32
-                if len(gate_shape) == 2:
-                    expected_4bit = gate_shape[0] * gate_shape[1] * 4  # U32 count * 4 bytes
-                    elements = gate_shape[0] * gate_shape[1]  # actual packed elements
-                    # 4-bit: elements = out * in/8, 8-bit: elements = out * in/4
-                    # If actual bytes = num_experts * (hidden/4) * 4, it's 8-bit
-                    expected_8bit_u32 = num_experts * (hidden_size // 4)
-                    expected_4bit_u32 = num_experts * (hidden_size // 8)
-                    if gate_shape[1] == hidden_size // 4:
-                        gate_bits = 8
-                    elif gate_shape[1] == hidden_size // 8:
-                        gate_bits = 4
+    # Linear attention (GatedDeltaNet) params — all live in text_config for Qwen3.x
+    linear_num_v_heads = text_cfg.get('linear_num_value_heads', 64)
+    linear_num_k_heads = text_cfg.get('linear_num_key_heads', 16)
+    linear_key_dim = text_cfg.get('linear_key_head_dim', 128)
+    linear_value_dim = text_cfg.get('linear_value_head_dim', 128)
+    linear_conv_kernel = text_cfg.get('linear_conv_kernel_dim', 4)
+
+    # Detect gate quantization bits from quantization_config overrides
+    quant_cfg = model_cfg.get('quantization_config', model_cfg.get('quantization', {}))
+    gate_bits = int(quant_cfg.get('bits', 4))  # default quant bits
+    # Check if any gate layer has an override (e.g. 8-bit for routing precision)
+    for key, val in quant_cfg.items():
+        if '.mlp.gate' in key and isinstance(val, dict) and 'bits' in val:
+            gate_bits = int(val['bits'])
             break
 
     print(f"\nAuto-detected model config:")
