@@ -360,6 +360,8 @@ static float g_temperature = 0.0f; // 0 = greedy (argmax), >0 = temperature samp
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
 static uint8_t g_expert_seen[MAX_LAYERS][MAX_EXPERTS / 8];  // bitset: seen before?
 
+static char * g_model_path = NULL;
+
 // Async pread state defined after InferPreadTask (see below)
 
 static inline int expert_is_seen(int layer, int expert) {
@@ -887,26 +889,25 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
 
-static void init_tokenizer(void) {
+static void init_tokenizer(const char *model_path) {
     if (g_tokenizer_loaded) return;
-    const char *paths[] = {
-        "tokenizer.bin",
-        "metal_infer/tokenizer.bin",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        if (access(paths[i], R_OK) == 0) {
-            if (bpe_load(&g_tokenizer, paths[i]) == 0) {
-                g_tokenizer_loaded = 1;
-                return;
-            }
+    const char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path),
+        "%s/tokenizer.bin", model_path);
+
+
+    if (access(tokenizer_path, R_OK) == 0) {
+        if (bpe_load(&g_tokenizer, tokenizer_path) == 0) {
+            g_tokenizer_loaded = 1;
+            return;
         }
     }
+
     fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
 }
 
 static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
-    init_tokenizer();
+    init_tokenizer(g_model_path);
     if (!g_tokenizer_loaded) return NULL;
 
     // Allocate output buffer (generous: 4 tokens per character worst case)
@@ -8182,13 +8183,28 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Build default paths
+        // Build default paths relative to model_path
+        // When --model is set, model_path may be a prepared output directory
+        // containing model_weights.bin, model_weights.json, vocab.bin, etc.
+        // Fall back to the old cwd-based lookups for backward compat.
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
-        // Try to find files relative to the executable
+        g_model_path = model_path;
+
         if (!weights_path) {
+            // First: try model_path/metal_infer/model_weights.bin (dev tree layout)
+            // Then:  try model_path/model_weights.bin (prepared output dir layout)
+            // Then:  fall back to cwd (old behavior for "." model_path)
             snprintf(default_weights, sizeof(default_weights),
-                     "metal_infer/model_weights.bin");
+                     "%s/metal_infer/model_weights.bin", model_path);
+            if (access(default_weights, R_OK) != 0) {
+                snprintf(default_weights, sizeof(default_weights),
+                         "%s/model_weights.bin", model_path);
+            }
+            if (access(default_weights, R_OK) != 0) {
+                snprintf(default_weights, sizeof(default_weights),
+                         "metal_infer/model_weights.bin");
+            }
             if (access(default_weights, R_OK) != 0) {
                 snprintf(default_weights, sizeof(default_weights),
                          "model_weights.bin");
@@ -8197,7 +8213,15 @@ int main(int argc, char **argv) {
         }
         if (!manifest_path) {
             snprintf(default_manifest, sizeof(default_manifest),
-                     "metal_infer/model_weights.json");
+                     "%s/metal_infer/model_weights.json", model_path);
+            if (access(default_manifest, R_OK) != 0) {
+                snprintf(default_manifest, sizeof(default_manifest),
+                         "%s/model_weights.json", model_path);
+            }
+            if (access(default_manifest, R_OK) != 0) {
+                snprintf(default_manifest, sizeof(default_manifest),
+                         "metal_infer/model_weights.json");
+            }
             if (access(default_manifest, R_OK) != 0) {
                 snprintf(default_manifest, sizeof(default_manifest),
                          "model_weights.json");
@@ -8206,7 +8230,15 @@ int main(int argc, char **argv) {
         }
         if (!vocab_path) {
             snprintf(default_vocab, sizeof(default_vocab),
-                     "metal_infer/vocab.bin");
+                     "%s/metal_infer/vocab.bin", model_path);
+            if (access(default_vocab, R_OK) != 0) {
+                snprintf(default_vocab, sizeof(default_vocab),
+                         "%s/vocab.bin", model_path);
+            }
+            if (access(default_vocab, R_OK) != 0) {
+                snprintf(default_vocab, sizeof(default_vocab),
+                         "metal_infer/vocab.bin");
+            }
             if (access(default_vocab, R_OK) != 0) {
                 snprintf(default_vocab, sizeof(default_vocab),
                          "vocab.bin");
