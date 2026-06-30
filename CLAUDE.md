@@ -4,6 +4,67 @@
 
 Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **4.4+ tokens/second** with production-quality output including tool calling.
 
+## What's New in This Fork
+
+This fork adds **universal Qwen3.x-MoE support** — the same engine now works with any Qwen3.x MoE model (122B, 35B, 397B) from a single codebase. Major additions:
+
+### `prepare_model.py` — One-Command Setup (New!)
+
+Replace the manual 4-step dance with a single command:
+
+```bash
+python prepare_model.py --model /path/to/Qwen3.x-Model-4bit
+```
+
+It does **everything** in one shot:
+1. Generates `expert_index.json` (expert byte offsets)
+2. Extracts non-expert weights → `model_weights.bin` + `model_weights.json`
+3. Exports tokenizer → `tokenizer.bin` + `vocab.bin`
+4. Repacks expert weights → `packed_experts/layer_XX.bin`
+
+All artifacts land in `./prepared/<model_name>/`, ready for the C engine. Options include `--no-repack` (quick setup), `--light` (skip large files), `--dry-run`, and `--output-dir`.
+
+### `--model` Flag — Auto-Discover All Paths
+
+The C inference engine now accepts a **model directory** instead of four separate file paths:
+
+```bash
+./infer --model /path/to/prepared/Qwen3.5-122B --prompt "Hello" --tokens 50
+```
+
+It auto-discovers `model_weights.bin`, `model_weights.json`, `vocab.bin`, and `tokenizer.bin` by scanning the model directory, then falling back to `metal_infer/` subdirectory, then the CWD. No more hunting for files.
+
+### `--serve` — OpenAI-Compatible HTTP Server improvements
+
+Run a full **OpenAI-compatible HTTP API** directly from the C engine:
+
+```bash
+./infer --model <path to prepared model> --serve 8080
+```
+
+Endpoints:
+- `POST /v1/chat/completions` — Chat with SSE streaming, tool calling, thinking tokens
+- `GET /v1/models` — Model info listing
+- `GET /health` — Health check
+
+Features:
+- **System prompt caching** — pre-fills once at startup, restores from snapshot per request
+- **SSE streaming** — token-by-token `data:` events with `[DONE]` termination
+- **CORS support** — `Access-Control-Allow-Origin: *` on all responses
+- **Session management** — tracks active session with KV-cache + linear-state snapshots
+- **Tool calling support** — parses OpenAI `tools` JSON array into the engine's tool format
+- **Auto-continuation detection** — recognizes `continue` and `auto` finish reasons for seamless multi-turn
+
+### Streamlined Build & Repack
+
+- `extract_weights.py` now auto-detects model config (hidden size, layers, experts) from `config.json` — no hardcoded constants.
+- `usage.txt` fully rewritten with the new unified workflow, deprecating old step-by-step instructions.
+- `repack_experts_2bit.py` split into its own script, cleaner maintenance.
+
+### What Stayed the Same
+
+The core engine (inference pipeline, Metal shaders, SSD streaming, FMA dequant) is unchanged — all the performance numbers from the paper still hold. The fork just makes it **easier to run** on any Qwen3.x MoE model.
+
 The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
 
 ## Results
