@@ -78,7 +78,7 @@ def load_index(index_path):
     """Load expert_index.json and return (expert_reads, model_path, num_experts)."""
     with open(index_path) as f:
         idx = json.load(f)
-    return idx['expert_reads'], idx['model_path'], idx.get('num_experts', 256)
+    return idx['expert_reads'], idx['model_path'], idx['num_experts']
 
 
 def verify_component_sizes(expert_reads, components):
