@@ -607,7 +607,7 @@ def step3b_export_vocab(model_path, output_dir, dry_run):
 def step4_repack_experts(model_path, output_dir, layers_spec, dry_run):
     """Repack expert weights into contiguous per-layer binary files."""
     if dry_run:
-        print(f"  [3] Would repack experts → {output_dir / 'packed_experpts'}/")
+        print(f"  [4] Would repack experts → {output_dir / 'packed_experts'}/")
         return True
 
     print("[3] Repacking experts...")
@@ -723,6 +723,9 @@ def step4_repack_experts(model_path, output_dir, layers_spec, dry_run):
 
     elapsed = time.monotonic() - t0
     print(f"  -> {out_dir}/: {total_written/1e9:.1f} GB in {elapsed:.1f}s")
+
+    for fd in fds.values():
+        __import__("os").close(fd)
 
     return True
 
