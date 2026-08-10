@@ -362,6 +362,8 @@ static uint8_t g_expert_seen[MAX_LAYERS][MAX_EXPERTS / 8];  // bitset: seen befo
 
 static char * g_model_path = NULL;
 
+static int g_debug_level = 0;  // 0=none, 1=basic, 2=verbose
+
 // Async pread state defined after InferPreadTask (see below)
 
 static inline int expert_is_seen(int layer, int expert) {
@@ -1144,6 +1146,9 @@ static int cpu_argmax(const float *x, int dim) {
 
 // Temperature sampling: apply softmax with temperature, then sample via CDF.
 // Falls back to argmax if temperature <= 0.
+float *probs = NULL;
+int probs_capacity = 0;
+
 static int cpu_sample(const float *logits, int dim, float temperature) {
     if (temperature <= 0.0f) return cpu_argmax(logits, dim);
 
@@ -1152,7 +1157,11 @@ static int cpu_sample(const float *logits, int dim, float temperature) {
     for (int i = 1; i < dim; i++) if (logits[i] > max_val) max_val = logits[i];
 
     // Compute softmax with temperature
-    float *probs = malloc((size_t)dim * sizeof(float));
+    if (dim > probs_capacity) {
+        free(probs);
+        probs_capacity = dim;
+        probs = malloc((size_t)dim * sizeof(float));
+    }
     float sum = 0.0f;
     for (int i = 0; i < dim; i++) {
         probs[i] = expf((logits[i] - max_val) / temperature);
@@ -1168,7 +1177,6 @@ static int cpu_sample(const float *logits, int dim, float temperature) {
         cdf += probs[i];
         if (r < cdf) { result = i; break; }
     }
-    free(probs);
     return result;
 }
 
@@ -7366,14 +7374,16 @@ static void serve_loop(
             }
             body += 4;
 
-            // Log full request for debugging
-            int body_len = (int)strlen(body);
-            fprintf(stderr, "\n[serve] === NEW REQUEST (%d bytes) ===\n", body_len);
-            if (body_len <= 200000) {
-                fprintf(stderr, "%s\n", body);
-            } else {
-                fprintf(stderr, "%.1000s\n...(%d bytes omitted)...\n%.500s\n",
-                        body, body_len - 1500, body + body_len - 500);
+            if (g_debug_level > 1) {
+                // Log full request for debugging
+                int body_len = (int)strlen(body);
+                fprintf(stderr, "\n[serve] === NEW REQUEST (%d bytes) ===\n", body_len);
+                if (body_len <= 200000) {
+                    fprintf(stderr, "%s\n", body);
+                } else {
+                    fprintf(stderr, "%.1000s\n...(%d bytes omitted)...\n%.500s\n",
+                            body, body_len - 1500, body + body_len - 500);
+                }
             }
             fprintf(stderr, "[serve] has_user_message=%d\n", has_user_message(body));
 
@@ -8102,6 +8112,7 @@ static void print_usage(const char *prog) {
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --temp T             Sampling temperature (default: 0.0 = greedy argmax)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --debug LEVEL        Set debug level (0=none, 1=basic, 2=verbose)\n");
     printf("  --help               This message\n");
 }
 
@@ -8144,6 +8155,7 @@ int main(int argc, char **argv) {
             {"collect-routing", required_argument, 0, 'Z'},
             {"temp",          required_argument, 0, 'X'},
             {"help",          no_argument,       0, 'h'},
+            {"debug",         required_argument, 0, 'd'},
             {0, 0, 0, 0}
         };
 
@@ -8168,6 +8180,7 @@ int main(int argc, char **argv) {
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
+                case 'd': g_debug_level = atoi(optarg); break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
