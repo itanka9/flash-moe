@@ -1,14 +1,14 @@
 /*
- * infer.m — Complete Qwen3.5-397B inference engine using Metal
+ * infer.m — Complete Qwen3.5-122B inference engine using Metal
  *
- * Full forward pass: embedding -> 60 transformer layers -> norm -> lm_head -> sample
+ * Full forward pass: embedding -> 48 transformer layers -> norm -> lm_head -> sample
  * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
  * Expert weights loaded from packed_experts/ per layer per token (pread)
  *
- * Architecture: Qwen3.5-397B-A17B (MoE)
- *   - 60 layers: 45 linear attention (GatedDeltaNet) + 15 full attention
- *   - hidden_size=4096, head_dim=256, num_attention_heads=32, num_kv_heads=2
- *   - 512 experts/layer, 10 active (we use K=4 for speed)
+ * Architecture: Qwen3.6-35B-A3B (MoE)
+ *   - 40 layers: 30 linear attention (GatedDeltaNet) + 10 full attention
+ *   - hidden_size=2048, head_dim=256, num_attention_heads=16, num_kv_heads=2
+ *   - 256 experts/layer, 8 active
  *   - Shared expert per layer (always active)
  *   - Linear attention: conv1d(kernel=4) + gated delta recurrence
  *   - Full attention: standard QKV + scaled dot product + RoPE
@@ -66,65 +66,224 @@
 #include <compression.h>
 
 // ============================================================================
-// Model constants
+// Model configuration — loaded from model_weights.json at runtime
 // ============================================================================
 
-#define HIDDEN_DIM          4096
-#define NUM_LAYERS          60
-#define NUM_ATTN_HEADS      32
-#define NUM_KV_HEADS        2
-#define HEAD_DIM            256
-#define VOCAB_SIZE          248320
+// Maximum array sizes for struct declarations (covers all known Qwen3.x-MoE models)
+#define MAX_LAYERS              64
+#define MAX_FULL_ATTN_LAYERS    16
+#define MAX_LINEAR_LAYERS       48
+#define MAX_K                   16   // maximum experts per token
+#define MAX_EXPERTS             512  // maximum experts per layer
+#define MAX_HIDDEN_DIM          4096 // maximum hidden dimension
+
+// Fixed constants that don't vary across models
 #define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         512
-#define NUM_EXPERTS_PER_TOK 10
-#define MOE_INTERMEDIATE    1024
-#define SHARED_INTERMEDIATE 1024
-#define FULL_ATTN_INTERVAL  4
-#define GROUP_SIZE          64
-#define BITS                4
-
-// Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  64
-#define LINEAR_NUM_K_HEADS  16
-#define LINEAR_KEY_DIM      128   // head_k_dim
-#define LINEAR_VALUE_DIM    128   // head_v_dim
-#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
 #define CONV_KERNEL_SIZE    4
+#define MAX_SEQ_LEN         1048576  // 1M context
+#define GPU_KV_SEQ          8192     // GPU KV buffer pre-allocation
 
-// Full attention constants
-#define ROPE_THETA          10000000.0f
-#define PARTIAL_ROTARY      0.25f
-#define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
-
-// Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         7077888
-
-// 2-bit expert layout (from repack_experts_2bit.py)
-#define EXPERT_SIZE_2BIT    3932160
-#define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  1048576
-#define GATE_B_OFF_2  1179648
-#define UP_W_OFF_2    1310720
-#define UP_S_OFF_2    2359296
-#define UP_B_OFF_2    2490368
-#define DOWN_W_OFF_2  2621440
-#define DOWN_S_OFF_2  3670016
-#define DOWN_B_OFF_2  3801088
-
-// KV cache maximum context length
-#define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
-#define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
-
-// Special tokens
+// Special tokens (Qwen3.x family)
 #define EOS_TOKEN_1         248046
 #define EOS_TOKEN_2         248044
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+// Runtime model configuration (populated from model_weights.json "config" section)
+typedef struct {
+    // Core dimensions
+    int hidden_dim;
+    int num_layers;
+    int num_attn_heads;
+    int num_kv_heads;
+    int head_dim;
+    int vocab_size;
+    int num_experts;
+    int num_experts_per_tok;
+    int moe_intermediate;
+    int shared_intermediate;
+    int full_attn_interval;
+    int group_size;
+    int bits;
+
+    // Linear attention (GatedDeltaNet)
+    int linear_num_v_heads;
+    int linear_num_k_heads;
+    int linear_key_dim;
+    int linear_value_dim;
+
+    // Full attention
+    float rope_theta;
+    float partial_rotary;
+
+    // Gate quantization (4 or 8 bits)
+    int gate_bits;
+
+    // --- Derived values (computed after loading) ---
+    int linear_total_key;     // linear_num_k_heads * linear_key_dim
+    int linear_total_value;   // linear_num_v_heads * linear_value_dim
+    int linear_conv_dim;      // linear_total_key * 2 + linear_total_value
+    int delta_state_size;     // linear_num_v_heads * linear_value_dim * linear_key_dim
+    int rotary_dim;           // (int)(head_dim * partial_rotary)
+    int num_full_attn_layers; // num_layers / full_attn_interval
+    int num_linear_layers;    // num_layers - num_full_attn_layers
+
+    // Expert layout offsets (4-bit)
+    size_t expert_size;
+    size_t gate_w_off, gate_s_off, gate_b_off;
+    size_t up_w_off, up_s_off, up_b_off;
+    size_t down_w_off, down_s_off, down_b_off;
+
+    // Expert layout offsets (2-bit)
+    size_t expert_size_2bit;
+    size_t gate_w_off_2, gate_s_off_2, gate_b_off_2;
+    size_t up_w_off_2, up_s_off_2, up_b_off_2;
+    size_t down_w_off_2, down_s_off_2, down_b_off_2;
+
+    // Model path
+    char model_path[1024];
+} ModelConfig;
+
+// Global config instance
+static ModelConfig CFG = {0};
+
+// Compute derived values and expert layout offsets from base config
+static void config_compute_derived(ModelConfig *c) {
+    c->linear_total_key   = c->linear_num_k_heads * c->linear_key_dim;
+    c->linear_total_value = c->linear_num_v_heads * c->linear_value_dim;
+    c->linear_conv_dim    = c->linear_total_key * 2 + c->linear_total_value;
+    c->delta_state_size   = c->linear_num_v_heads * c->linear_value_dim * c->linear_key_dim;
+    c->rotary_dim         = (int)(c->head_dim * c->partial_rotary);
+    c->num_full_attn_layers = c->num_layers / c->full_attn_interval;
+    c->num_linear_layers    = c->num_layers - c->num_full_attn_layers;
+
+    // 4-bit expert layout: gate[MOE_INT, HIDDEN], up[MOE_INT, HIDDEN], down[HIDDEN, MOE_INT]
+    int H = c->hidden_dim;
+    int M = c->moe_intermediate;
+    int G = c->group_size;
+    // gate_proj: weight = M*H/2 bytes (4-bit packed), scales = M*(H/G)*2, biases = M*(H/G)*2
+    size_t gate_w_size = (size_t)M * H / 2;
+    size_t gate_s_size = (size_t)M * (H / G) * 2;
+    size_t gate_b_size = gate_s_size;
+    // up_proj: same as gate
+    size_t up_w_size = gate_w_size;
+    size_t up_s_size = gate_s_size;
+    size_t up_b_size = gate_b_size;
+    // down_proj: weight = H*M/2, scales = H*(M/G)*2, biases = H*(M/G)*2
+    size_t down_w_size = (size_t)H * M / 2;
+    size_t down_s_size = (size_t)H * (M / G) * 2;
+    size_t down_b_size = down_s_size;
+
+    c->gate_w_off = 0;
+    c->gate_s_off = c->gate_w_off + gate_w_size;
+    c->gate_b_off = c->gate_s_off + gate_s_size;
+    c->up_w_off   = c->gate_b_off + gate_b_size;
+    c->up_s_off   = c->up_w_off + up_w_size;
+    c->up_b_off   = c->up_s_off + up_s_size;
+    c->down_w_off = c->up_b_off + up_b_size;
+    c->down_s_off = c->down_w_off + down_w_size;
+    c->down_b_off = c->down_s_off + down_s_size;
+    c->expert_size = c->down_b_off + down_b_size;
+
+    // 2-bit expert layout: weight = M*H/4, scales = M*(H/G)*2, biases = M*(H/G)*2
+    size_t gate_w_size_2 = (size_t)M * H / 4;
+    size_t gate_s_size_2 = gate_s_size;  // same scale/bias layout
+    size_t gate_b_size_2 = gate_b_size;
+    size_t up_w_size_2   = gate_w_size_2;
+    size_t up_s_size_2   = gate_s_size_2;
+    size_t up_b_size_2   = gate_b_size_2;
+    size_t down_w_size_2 = (size_t)H * M / 4;
+    size_t down_s_size_2 = down_s_size;
+    size_t down_b_size_2 = down_b_size;
+
+    c->gate_w_off_2 = 0;
+    c->gate_s_off_2 = c->gate_w_off_2 + gate_w_size_2;
+    c->gate_b_off_2 = c->gate_s_off_2 + gate_s_size_2;
+    c->up_w_off_2   = c->gate_b_off_2 + gate_b_size_2;
+    c->up_s_off_2   = c->up_w_off_2 + up_w_size_2;
+    c->up_b_off_2   = c->up_s_off_2 + up_s_size_2;
+    c->down_w_off_2 = c->up_b_off_2 + up_b_size_2;
+    c->down_s_off_2 = c->down_w_off_2 + down_w_size_2;
+    c->down_b_off_2 = c->down_s_off_2 + down_s_size_2;
+    c->expert_size_2bit = c->down_b_off_2 + down_b_size_2;
+}
+
+// Set default config (Qwen3.5-397B-A17B — largest model)
+static void config_set_defaults(ModelConfig *c) {
+    c->hidden_dim = 4096;
+    c->num_layers = 60;
+    c->num_attn_heads = 32;
+    c->num_kv_heads = 2;
+    c->head_dim = 256;
+    c->vocab_size = 248320;
+    c->num_experts = 512;
+    c->num_experts_per_tok = 10;
+    c->moe_intermediate = 1024;
+    c->shared_intermediate = 1024;
+    c->full_attn_interval = 4;
+    c->group_size = 64;
+    c->bits = 4;
+    c->linear_num_v_heads = 64;
+    c->linear_num_k_heads = 16;
+    c->linear_key_dim = 128;
+    c->linear_value_dim = 128;
+    c->rope_theta = 10000000.0f;
+    c->partial_rotary = 0.25f;
+    c->gate_bits = 4;  // default: 4-bit gate (397B, 122B)
+    snprintf(c->model_path, sizeof(c->model_path), ".");
+    config_compute_derived(c);
+}
+
+// Convenience macros for backward compatibility during migration
+// These read from the global CFG and will be removed once migration is complete.
+#define HIDDEN_DIM          (CFG.hidden_dim)
+#define NUM_LAYERS          (CFG.num_layers)
+#define NUM_ATTN_HEADS      (CFG.num_attn_heads)
+#define NUM_KV_HEADS        (CFG.num_kv_heads)
+#define HEAD_DIM            (CFG.head_dim)
+#define VOCAB_SIZE          (CFG.vocab_size)
+#define NUM_EXPERTS         (CFG.num_experts)
+#define NUM_EXPERTS_PER_TOK (CFG.num_experts_per_tok)
+#define MOE_INTERMEDIATE    (CFG.moe_intermediate)
+#define SHARED_INTERMEDIATE (CFG.shared_intermediate)
+#define FULL_ATTN_INTERVAL  (CFG.full_attn_interval)
+#define GROUP_SIZE          (CFG.group_size)
+#define BITS                (CFG.bits)
+#define LINEAR_NUM_V_HEADS  (CFG.linear_num_v_heads)
+#define LINEAR_NUM_K_HEADS  (CFG.linear_num_k_heads)
+#define LINEAR_KEY_DIM      (CFG.linear_key_dim)
+#define LINEAR_VALUE_DIM    (CFG.linear_value_dim)
+#define LINEAR_TOTAL_KEY    (CFG.linear_total_key)
+#define LINEAR_TOTAL_VALUE  (CFG.linear_total_value)
+#define LINEAR_CONV_DIM     (CFG.linear_conv_dim)
+#define DELTA_STATE_SIZE    (CFG.delta_state_size)
+#define ROPE_THETA          (CFG.rope_theta)
+#define PARTIAL_ROTARY      (CFG.partial_rotary)
+#define ROTARY_DIM          (CFG.rotary_dim)
+#define EXPERT_SIZE         (CFG.expert_size)
+#define GATE_W_OFF          (CFG.gate_w_off)
+#define GATE_S_OFF          (CFG.gate_s_off)
+#define GATE_B_OFF          (CFG.gate_b_off)
+#define UP_W_OFF            (CFG.up_w_off)
+#define UP_S_OFF            (CFG.up_s_off)
+#define UP_B_OFF            (CFG.up_b_off)
+#define DOWN_W_OFF          (CFG.down_w_off)
+#define DOWN_S_OFF          (CFG.down_s_off)
+#define DOWN_B_OFF          (CFG.down_b_off)
+#define EXPERT_SIZE_2BIT    (CFG.expert_size_2bit)
+#define GATE_W_OFF_2        (CFG.gate_w_off_2)
+#define GATE_S_OFF_2        (CFG.gate_s_off_2)
+#define GATE_B_OFF_2        (CFG.gate_b_off_2)
+#define UP_W_OFF_2          (CFG.up_w_off_2)
+#define UP_S_OFF_2          (CFG.up_s_off_2)
+#define UP_B_OFF_2          (CFG.up_b_off_2)
+#define DOWN_W_OFF_2        (CFG.down_w_off_2)
+#define DOWN_S_OFF_2        (CFG.down_s_off_2)
+#define DOWN_B_OFF_2        (CFG.down_b_off_2)
+#define NUM_FULL_ATTN_LAYERS (CFG.num_full_attn_layers)
+#define NUM_LINEAR_LAYERS    (CFG.num_linear_layers)
+
+#define MODEL_PATH_DEFAULT  "."
 
 // ============================================================================
 // Timing helper
@@ -182,7 +341,7 @@ typedef struct {
     uint32_t raw_size;
 } LZ4IndexEntry;
 
-static LZ4IndexEntry *g_lz4_index[NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
+static LZ4IndexEntry *g_lz4_index[MAX_LAYERS];  // per-layer index (NULL if not using LZ4)
 static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
@@ -190,15 +349,20 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 // Expert frequency tracking (diagnostic: --freq flag)
 // ============================================================================
 
-static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
+static int g_expert_freq[MAX_LAYERS][MAX_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static float g_temperature = 0.0f; // 0 = greedy (argmax), >0 = temperature sampling
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
-static uint8_t g_expert_seen[NUM_LAYERS][NUM_EXPERTS / 8];  // bitset: seen before?
+static uint8_t g_expert_seen[MAX_LAYERS][MAX_EXPERTS / 8];  // bitset: seen before?
+
+static char * g_model_path = NULL;
+
+static int g_debug_level = 0;  // 0=none, 1=basic, 2=verbose
 
 // Async pread state defined after InferPreadTask (see below)
 
@@ -238,9 +402,9 @@ typedef struct {
 } CacheTelemetry;
 
 static CacheTelemetry g_cache_telemetry = {0};
-static uint8_t g_cache_seen[NUM_LAYERS][NUM_EXPERTS];
-static uint64_t g_cache_last_touch_token[NUM_LAYERS][NUM_EXPERTS];
-static uint64_t g_cache_last_evict_token[NUM_LAYERS][NUM_EXPERTS];
+static uint8_t g_cache_seen[MAX_LAYERS][MAX_EXPERTS];
+static uint64_t g_cache_last_touch_token[MAX_LAYERS][MAX_EXPERTS];
+static uint64_t g_cache_last_evict_token[MAX_LAYERS][MAX_EXPERTS];
 
 static void cache_telemetry_reset(void) {
     memset(&g_cache_telemetry, 0, sizeof(g_cache_telemetry));
@@ -461,6 +625,86 @@ static TensorManifest *load_manifest(const char *json_path) {
     }
 }
 
+// Load model config from model_weights.json "config" section into global CFG
+static int load_config_from_json(const char *json_path) {
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:json_path]];
+        if (!data) {
+            fprintf(stderr, "WARNING: Cannot read %s for config, using defaults\n", json_path);
+            return -1;
+        }
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data
+                                                             options:0
+                                                               error:&error];
+        if (!root) return -1;
+
+        NSDictionary *config = root[@"config"];
+        if (!config) {
+            fprintf(stderr, "WARNING: No 'config' section in manifest, using defaults\n");
+            return -1;
+        }
+
+        // Read all config fields (with fallback to defaults already in CFG)
+        if (config[@"hidden_size"])
+            CFG.hidden_dim = [config[@"hidden_size"] intValue];
+        if (config[@"num_hidden_layers"])
+            CFG.num_layers = [config[@"num_hidden_layers"] intValue];
+        if (config[@"num_attention_heads"])
+            CFG.num_attn_heads = [config[@"num_attention_heads"] intValue];
+        if (config[@"num_key_value_heads"])
+            CFG.num_kv_heads = [config[@"num_key_value_heads"] intValue];
+        if (config[@"head_dim"])
+            CFG.head_dim = [config[@"head_dim"] intValue];
+        if (config[@"vocab_size"])
+            CFG.vocab_size = [config[@"vocab_size"] intValue];
+        if (config[@"num_experts"])
+            CFG.num_experts = [config[@"num_experts"] intValue];
+        if (config[@"num_experts_per_tok"])
+            CFG.num_experts_per_tok = [config[@"num_experts_per_tok"] intValue];
+        if (config[@"moe_intermediate_size"])
+            CFG.moe_intermediate = [config[@"moe_intermediate_size"] intValue];
+        if (config[@"shared_expert_intermediate_size"])
+            CFG.shared_intermediate = [config[@"shared_expert_intermediate_size"] intValue];
+        if (config[@"full_attention_interval"])
+            CFG.full_attn_interval = [config[@"full_attention_interval"] intValue];
+        if (config[@"group_size"])
+            CFG.group_size = [config[@"group_size"] intValue];
+        if (config[@"bits"])
+            CFG.bits = [config[@"bits"] intValue];
+        if (config[@"linear_num_value_heads"])
+            CFG.linear_num_v_heads = [config[@"linear_num_value_heads"] intValue];
+        if (config[@"linear_num_key_heads"])
+            CFG.linear_num_k_heads = [config[@"linear_num_key_heads"] intValue];
+        if (config[@"linear_key_head_dim"])
+            CFG.linear_key_dim = [config[@"linear_key_head_dim"] intValue];
+        if (config[@"linear_value_head_dim"])
+            CFG.linear_value_dim = [config[@"linear_value_head_dim"] intValue];
+        if (config[@"rope_theta"])
+            CFG.rope_theta = [config[@"rope_theta"] floatValue];
+        if (config[@"partial_rotary_factor"])
+            CFG.partial_rotary = [config[@"partial_rotary_factor"] floatValue];
+        if (config[@"gate_bits"])
+            CFG.gate_bits = [config[@"gate_bits"] intValue];
+
+        // Recompute all derived values
+        config_compute_derived(&CFG);
+
+        printf("[config] Loaded: hidden=%d layers=%d heads=%d experts=%d topK=%d moe_int=%d gate_bits=%d\n",
+               CFG.hidden_dim, CFG.num_layers, CFG.num_attn_heads,
+               CFG.num_experts, CFG.num_experts_per_tok, CFG.moe_intermediate, CFG.gate_bits);
+        printf("[config] Linear attn: v_heads=%d k_heads=%d key_dim=%d val_dim=%d\n",
+               CFG.linear_num_v_heads, CFG.linear_num_k_heads,
+               CFG.linear_key_dim, CFG.linear_value_dim);
+        printf("[config] Expert sizes: 4-bit=%zu 2-bit=%zu\n",
+               CFG.expert_size, CFG.expert_size_2bit);
+
+        return 0;
+    }
+}
+
 // Hash table for O(1) tensor lookup (replaces O(N) linear scan).
 // FNV-1a hash, open addressing with linear probing.
 #define TENSOR_HT_SIZE 8192  // power of 2, > 4x num_tensors (2092)
@@ -647,26 +891,25 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
 
-static void init_tokenizer(void) {
+static void init_tokenizer(const char *model_path) {
     if (g_tokenizer_loaded) return;
-    const char *paths[] = {
-        "tokenizer.bin",
-        "metal_infer/tokenizer.bin",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        if (access(paths[i], R_OK) == 0) {
-            if (bpe_load(&g_tokenizer, paths[i]) == 0) {
-                g_tokenizer_loaded = 1;
-                return;
-            }
+    const char tokenizer_path[1024];
+    snprintf(tokenizer_path, sizeof(tokenizer_path),
+        "%s/tokenizer.bin", model_path);
+
+
+    if (access(tokenizer_path, R_OK) == 0) {
+        if (bpe_load(&g_tokenizer, tokenizer_path) == 0) {
+            g_tokenizer_loaded = 1;
+            return;
         }
     }
+
     fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
 }
 
 static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
-    init_tokenizer();
+    init_tokenizer(g_model_path);
     if (!g_tokenizer_loaded) return NULL;
 
     // Allocate output buffer (generous: 4 tokens per character worst case)
@@ -731,6 +974,55 @@ static void cpu_dequant_matvec(
             }
         }
         out[row] = acc;
+    }
+}
+
+// 8-bit variant: each U32 packs 4 uint8 values instead of 8 nibbles.
+// Used for mlp.gate and mlp.shared_expert_gate (quantized at bits=8 in the 35B model).
+static void cpu_dequant_matvec_8bit(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    int num_groups = in_dim / group_size;
+    int packed_per_group = group_size / 4;  // 4 uint8 per U32
+    int packed_cols = in_dim / 4;           // U32 columns per row
+
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const uint32_t *w_row = W + row * packed_cols;
+        const uint16_t *s_row = scales + row * num_groups;
+        const uint16_t *b_row = biases + row * num_groups;
+
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32(s_row[g]);
+            float bias = bf16_to_f32(b_row[g]);
+            int base_packed = g * packed_per_group;
+            int base_x = g * group_size;
+
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[base_packed + p];
+                int x_base = base_x + p * 4;
+                for (int n = 0; n < 4; n++) {
+                    uint32_t byte = (packed >> (n * 8)) & 0xFF;
+                    acc += ((float)byte * scale + bias) * x[x_base + n];
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+// Gate dequant dispatch: uses 8-bit or 4-bit based on CFG.gate_bits
+static void cpu_dequant_matvec_gate(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    if (CFG.gate_bits == 8) {
+        cpu_dequant_matvec_8bit(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    } else {
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
     }
 }
 
@@ -852,6 +1144,47 @@ static int cpu_argmax(const float *x, int dim) {
     return best;
 }
 
+// Temperature sampling: apply softmax with temperature, then sample via CDF.
+// Falls back to argmax if temperature <= 0.
+float *probs = NULL;
+int probs_capacity = 0;
+
+static int cpu_sample(const float *logits, int dim, float temperature) {
+    if (temperature <= 0.0f) return cpu_argmax(logits, dim);
+
+    // Find max for numerical stability
+    float max_val = logits[0];
+    for (int i = 1; i < dim; i++) if (logits[i] > max_val) max_val = logits[i];
+
+    // Compute softmax with temperature
+    if (dim > probs_capacity) {
+        free(probs);
+        probs_capacity = dim;
+        probs = malloc((size_t)dim * sizeof(float));
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        probs[i] = expf((logits[i] - max_val) / temperature);
+        sum += probs[i];
+    }
+    for (int i = 0; i < dim; i++) probs[i] /= sum;
+
+    // Sample from CDF
+    float r = (float)rand() / ((float)RAND_MAX + 1.0f);
+    float cdf = 0.0f;
+    int result = dim - 1;
+    for (int i = 0; i < dim; i++) {
+        cdf += probs[i];
+        if (r < cdf) { result = i; break; }
+    }
+    return result;
+}
+
+// Sample next token using current global temperature setting
+static inline int sample_next_token(const float *logits, int dim) {
+    return cpu_sample(logits, dim, g_temperature);
+}
+
 // SiLU activation
 static void cpu_silu(float *x, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -934,7 +1267,6 @@ typedef struct {
     // Each expert k uses slot [k].
     // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
     // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
@@ -953,9 +1285,8 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 15
-    id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
-    id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    id<MTLBuffer> buf_kv_k[MAX_FULL_ATTN_LAYERS];  // K cache per full-attn layer
+    id<MTLBuffer> buf_kv_v[MAX_FULL_ATTN_LAYERS];  // V cache per full-attn layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
@@ -975,9 +1306,8 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
-    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
-    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
+    id<MTLBuffer> buf_delta_state[MAX_LINEAR_LAYERS];   // [v_heads*v_dim*k_dim] float per layer
+    id<MTLBuffer> buf_conv_state[MAX_LINEAR_LAYERS];    // [3*conv_dim] float per layer
     // Scratch buffers for delta-net inputs/outputs
     id<MTLBuffer> buf_delta_q;        // [2048] float
     id<MTLBuffer> buf_delta_k;        // [2048] float
@@ -1193,22 +1523,22 @@ static MetalCtx *metal_setup(void) {
     // Persistent GPU state buffers for delta-net (linear attention layers)
     if (ctx->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
+            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:DELTA_STATE_SIZE*sizeof(float)
                                                                options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*12288*sizeof(float)
+            memset([ctx->buf_delta_state[i] contents], 0, DELTA_STATE_SIZE*sizeof(float));
+            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:(3*LINEAR_CONV_DIM)*sizeof(float)
                                                               options:MTLResourceStorageModeShared];
-            memset([ctx->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([ctx->buf_conv_state[i] contents], 0, (3*LINEAR_CONV_DIM)*sizeof(float));
         }
         // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
         ctx->buf_delta_q       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
         ctx->buf_delta_k       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_v       = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_output  = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_conv_input    = [ctx->device newBufferWithLength:LINEAR_CONV_DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_conv_output   = [ctx->device newBufferWithLength:LINEAR_CONV_DIM*sizeof(float) options:MTLResourceStorageModeShared];
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                NUM_LINEAR_LAYERS,
                NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
@@ -1228,9 +1558,9 @@ static void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
         if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
+            memset([g_metal->buf_delta_state[i] contents], 0, DELTA_STATE_SIZE*sizeof(float));
         if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([g_metal->buf_conv_state[i] contents], 0, (3*LINEAR_CONV_DIM)*sizeof(float));
     }
 }
 
@@ -1512,9 +1842,9 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
+        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
+        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1608,9 +1938,9 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
+        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
+        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1708,9 +2038,9 @@ static void gpu_encode_experts_batched(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
+        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
+        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1793,15 +2123,15 @@ static void gpu_encode_expert_forward(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
-    NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    NSUInteger gate_w_off = GATE_W_OFF;
+    NSUInteger gate_s_off = GATE_S_OFF;
+    NSUInteger gate_b_off = GATE_B_OFF;
+    NSUInteger up_w_off   = UP_W_OFF;
+    NSUInteger up_s_off   = UP_S_OFF;
+    NSUInteger up_b_off   = UP_B_OFF;
+    NSUInteger down_w_off = DOWN_W_OFF;
+    NSUInteger down_s_off = DOWN_S_OFF;
+    NSUInteger down_b_off = DOWN_B_OFF;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1917,9 +2247,9 @@ static void gpu_expert_forward(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
+        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
+        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1930,8 +2260,8 @@ static void gpu_expert_forward(
     memcpy([ctx->buf_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;  // 1024
-    uint32_t gate_up_in  = HIDDEN_DIM;        // 4096
-    uint32_t down_out    = HIDDEN_DIM;        // 4096
+    uint32_t gate_up_in  = HIDDEN_DIM;        // 3072
+    uint32_t down_out    = HIDDEN_DIM;        // 3072
     uint32_t down_in     = MOE_INTERMEDIATE;  // 1024
     uint32_t gs          = GROUP_SIZE;        // 64
 
@@ -2708,6 +3038,11 @@ static void moe_forward(
     }
 
     // Softmax routing scores
+    // gate and shared_expert_gate quantization depends on model (4-bit or 8-bit)
+    if (gate_w && gate_s && gate_b)
+        cpu_dequant_matvec_gate(gate_w, gate_s, gate_b, h_post, gate_scores, NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
+    if (seg_w && seg_s && seg_b)
+        cpu_dequant_matvec_gate(seg_w, seg_s, seg_b, h_post, &shared_gate_score, 1, HIDDEN_DIM, GROUP_SIZE);
     cpu_softmax(gate_scores, NUM_EXPERTS);
 
     // Top-K expert selection
@@ -2756,14 +3091,14 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : GATE_S_OFF));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : GATE_B_OFF));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : UP_W_OFF));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : UP_S_OFF));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : UP_B_OFF));
+                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : DOWN_W_OFF));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : DOWN_S_OFF));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : DOWN_B_OFF));
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -2888,7 +3223,7 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    int group_size = HIDDEN_DIM / num_groups;  // 4096/64 = 64
+    int group_size = HIDDEN_DIM / num_groups;  // 3072/48 = 64
     int packed_per_group = group_size / 8;     // 8
 
     for (int g = 0; g < num_groups; g++) {
@@ -3215,7 +3550,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int entry_idx[MAX_LAYERS][MAX_EXPERTS];
     uint64_t access_counter; // monotonic, incremented on every access
     id<MTLDevice> device;    // for allocating new Metal buffers
     // Stats
@@ -3373,7 +3708,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int entry_idx[MAX_LAYERS][MAX_EXPERTS];
     uint64_t access_counter;
     uint64_t hits;
     uint64_t misses;
@@ -3643,7 +3978,7 @@ static void infer_prefetch_shutdown(void) {
 
 // ============================================================================
 // Per-layer weight pointer cache — built once, eliminates 40+ snprintf+lookup
-// per layer per token. With 60 layers and 15 tokens = 36,000 lookups saved.
+// per layer per token. With 48 layers and 15 tokens = 28,800 lookups saved.
 // ============================================================================
 
 typedef struct {
@@ -3677,7 +4012,7 @@ typedef struct {
     uint32_t *seg_w;  uint16_t *seg_s, *seg_b; // shared_expert_gate
 } LayerWeightCache;
 
-static LayerWeightCache layer_cache[NUM_LAYERS];
+static LayerWeightCache layer_cache[MAX_LAYERS];
 static int layer_cache_built = 0;
 
 static void build_layer_cache(WeightFile *wf) {
@@ -3819,7 +4154,7 @@ typedef struct {
     float expert_weights[MAX_K];        // routing weights for weighted accumulation
     int valid[MAX_K];                   // which experts loaded successfully
     int actual_K;                       // number of experts
-    float h_mid[HIDDEN_DIM];            // saved h_mid for final combine
+    float h_mid[MAX_HIDDEN_DIM];            // saved h_mid for final combine
     float shared_gate_score;            // saved shared expert gate score
     float *hidden;                      // pointer to hidden state (for writing final result)
     int layer_idx;                      // which layer produced this deferred state
@@ -3936,7 +4271,7 @@ static void discard_deferred_experts(void) {
 //   4. GPU-side combine in CMD3 (eliminates CPU deferred_wait + combine + norm)
 // ============================================================================
 
-// Static scratch buffers — allocated once, reused across all 60 layers per token.
+// Static scratch buffers — allocated once, reused across all 48 layers per token.
 // Eliminates ~20 malloc/free per layer = ~1200 alloc/free per token.
 static float *s_normed    = NULL;   // [HIDDEN_DIM]
 static float *s_residual  = NULL;   // [HIDDEN_DIM]
@@ -4378,7 +4713,7 @@ static void fused_layer_forward(
         memset(spec_scores, 0, NUM_EXPERTS * sizeof(float));
 
         // Gate projection matvec on pre-attention normed input (CPU, ~0.1ms for 512x4096)
-        cpu_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b,
+        cpu_dequant_matvec_gate(lc->gate_w, lc->gate_s, lc->gate_b,
                            normed, spec_scores,
                            NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
         cpu_softmax(spec_scores, NUM_EXPERTS);
@@ -5029,6 +5364,11 @@ static void fused_layer_forward(
 
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
+    // gate and shared_expert_gate quantization depends on model (4-bit or 8-bit)
+    cpu_dequant_matvec_gate(lc->gate_w, lc->gate_s, lc->gate_b,
+                            h_post, gate_scores, NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
+    cpu_dequant_matvec_gate(lc->seg_w, lc->seg_s, lc->seg_b,
+                            h_post, &shared_gate_score, 1, HIDDEN_DIM, GROUP_SIZE);
     cpu_softmax(gate_scores, NUM_EXPERTS);
     int expert_indices[64];
     float expert_weights[64];
@@ -5479,14 +5819,14 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : GATE_S_OFF));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : GATE_B_OFF));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : UP_W_OFF));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : UP_S_OFF));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : UP_B_OFF));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : DOWN_W_OFF));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : DOWN_S_OFF));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : DOWN_B_OFF));
 
             float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -5721,6 +6061,179 @@ static char *extract_last_content(char *buf) {
     return last;
 }
 
+// Extract the content of the last role:"user" message from the messages array.
+// Handles both formats:
+//   "content": "string"                         (simple)
+//   "content": [{"type":"text","text":"..."}]   (multimodal/Zed)
+// Returns malloc'd concatenated string; caller frees. NULL if not found.
+static char *extract_last_user_content(char *buf) {
+    // Find the messages array
+    char *msgs = strstr(buf, "\"messages\"");
+    if (!msgs) return NULL;
+    msgs = strchr(msgs, '[');
+    if (!msgs) return NULL;
+    char *end = buf + strlen(buf);
+    msgs++; // skip '['
+
+    char *last_user_obj_start = NULL;
+    char *last_user_obj_end = NULL;
+
+    // Walk through message objects looking for role:"user" messages
+    char *p = msgs;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+
+        // Find the matching closing brace for this message object
+        char *obj_start = p;
+        int depth = 0, in_str = 0;
+        while (p < end) {
+            if (in_str) {
+                if (*p == '\\') { p++; if (p < end) p++; continue; }
+                if (*p == '"') in_str = 0;
+            } else {
+                if (*p == '"') in_str = 1;
+                else if (*p == '{' || *p == '[') depth++;
+                else if (*p == '}' || *p == ']') { if (--depth == 0) { p++; break; } }
+            }
+            p++;
+        }
+        char *obj_end = p;
+
+        // Check if this message has role:"user"
+        char *role_p = strstr(obj_start, "\"role\"");
+        if (!role_p || role_p >= obj_end) continue;
+        char *rv = role_p + 6;
+        while (*rv == ' ' || *rv == ':' || *rv == '\t') rv++;
+        if (*rv != '"') continue;
+        rv++;
+        if (strncmp(rv, "user\"", 5) != 0) continue;
+
+        last_user_obj_start = obj_start;
+        last_user_obj_end = obj_end;
+    }
+
+    if (!last_user_obj_start) return NULL;
+
+    // Find the content field in the last user message
+    char *cp = strstr(last_user_obj_start, "\"content\"");
+    if (!cp || cp >= last_user_obj_end) return NULL;
+    cp += 9; // skip "content"
+    while (*cp == ' ' || *cp == '\t' || *cp == ':') cp++;
+
+    if (*cp == '"') {
+        // Simple string content: "content": "text..."
+        cp++; // skip opening quote
+        char *ce = cp;
+        while (*ce && !(*ce == '"' && (ce == cp || *(ce-1) != '\\'))) ce++;
+        size_t len = (size_t)(ce - cp);
+        char *result = malloc(len + 1);
+        if (!result) return NULL;
+        // Unescape
+        char *r = cp, *w = result;
+        while (r < ce) {
+            if (*r == '\\' && r + 1 < ce) {
+                r++;
+                switch (*r) {
+                    case 'n':  *w++ = '\n'; r++; break;
+                    case 't':  *w++ = '\t'; r++; break;
+                    case '"':  *w++ = '"';  r++; break;
+                    case '\\': *w++ = '\\'; r++; break;
+                    default:   *w++ = '\\'; *w++ = *r++; break;
+                }
+            } else {
+                *w++ = *r++;
+            }
+        }
+        *w = '\0';
+        return result;
+    } else if (*cp == '[') {
+        // Array content: "content": [{"type":"text","text":"..."}, ...]
+        // Concatenate all "text" fields from content parts
+        size_t cap = 4096, len = 0;
+        char *result = malloc(cap);
+        if (!result) return NULL;
+        result[0] = '\0';
+
+        char *ap = cp + 1; // skip '['
+        while (ap < last_user_obj_end) {
+            while (ap < last_user_obj_end && (*ap == ' ' || *ap == '\t' || *ap == '\n' || *ap == '\r' || *ap == ',')) ap++;
+            if (*ap == ']') break;
+            if (*ap != '{') break;
+
+            // Find end of this content part object
+            char *part_start = ap;
+            int d2 = 0, in_s2 = 0;
+            while (ap < last_user_obj_end) {
+                if (in_s2) {
+                    if (*ap == '\\') { ap++; if (ap < last_user_obj_end) ap++; continue; }
+                    if (*ap == '"') in_s2 = 0;
+                } else {
+                    if (*ap == '"') in_s2 = 1;
+                    else if (*ap == '{' || *ap == '[') d2++;
+                    else if (*ap == '}' || *ap == ']') { if (--d2 == 0) { ap++; break; } }
+                }
+                ap++;
+            }
+            char *part_end = ap;
+
+            // Find "text" field in this part (skip "type" field)
+            char *tp = part_start;
+            while (tp < part_end) {
+                tp = strstr(tp, "\"text\"");
+                if (!tp || tp >= part_end) break;
+                // Make sure this is the "text" key, not "type":"text"
+                // Check: preceded by comma, brace, or whitespace (not colon which would make it a value)
+                char *before = tp - 1;
+                while (before > part_start && (*before == ' ' || *before == '\t')) before--;
+                if (before > part_start && *before == ':') {
+                    // This "text" is a value (e.g. "type":"text"), skip it
+                    tp += 6;
+                    continue;
+                }
+                // This is the "text" key — extract its value
+                tp += 6; // skip "text"
+                while (tp < part_end && (*tp == ' ' || *tp == '\t' || *tp == ':')) tp++;
+                if (tp >= part_end || *tp != '"') break;
+                tp++; // skip opening quote
+                // Find closing quote
+                char *te = tp;
+                while (te < part_end && !(*te == '"' && *(te-1) != '\\')) te++;
+                // Unescape and append to result
+                char *r = tp;
+                while (r < te) {
+                    if (len + 4 >= cap) {
+                        cap *= 2;
+                        char *nb = realloc(result, cap);
+                        if (!nb) { free(result); return NULL; }
+                        result = nb;
+                    }
+                    if (*r == '\\' && r + 1 < te) {
+                        r++;
+                        switch (*r) {
+                            case 'n':  result[len++] = '\n'; r++; break;
+                            case 't':  result[len++] = '\t'; r++; break;
+                            case '"':  result[len++] = '"';  r++; break;
+                            case '\\': result[len++] = '\\'; r++; break;
+                            default:   result[len++] = '\\'; result[len++] = *r++; break;
+                        }
+                    } else {
+                        result[len++] = *r++;
+                    }
+                }
+                break; // done with this part's text
+            }
+        }
+        result[len] = '\0';
+        if (len == 0) { free(result); return NULL; }
+        return result;
+    } else if (strncmp(cp, "null", 4) == 0) {
+        return NULL;
+    }
+    return NULL;
+}
+
 // Extract "max_tokens" or "max_completion_tokens" from JSON body. Returns value or default.
 static int extract_max_tokens(const char *buf, int default_val) {
     const char *p = strstr(buf, "\"max_completion_tokens\"");
@@ -5729,6 +6242,235 @@ static int extract_max_tokens(const char *buf, int default_val) {
     p = strchr(p, ':');
     if (!p) return default_val;
     return atoi(p + 1);
+}
+
+// Extract the raw JSON of the "tools" array from the request body (non-mutating).
+// Sets *out_start to the '[' of the array, *out_len to its byte length.
+// Returns 1 if found and non-empty, 0 otherwise.
+static int extract_tools_json(const char *buf, const char **out_start, int *out_len) {
+    const char *p = strstr(buf, "\"tools\"");
+    if (!p) return 0;
+    p += 7;
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p != '[') return 0;
+    const char *start = p;
+    int depth = 0, in_str = 0;
+    while (*p) {
+        if (in_str) {
+            if (*p == '\\') { p++; if (*p) p++; continue; }
+            if (*p == '"') in_str = 0;
+        } else {
+            if (*p == '"') in_str = 1;
+            else if (*p == '[' || *p == '{') depth++;
+            else if (*p == ']' || *p == '}') { if (--depth == 0) { p++; break; } }
+        }
+        p++;
+    }
+    *out_start = start;
+    *out_len = (int)(p - start);
+    return (*out_len > 2);
+}
+
+// Split gen_response into reasoning_content and content by extracting <think>...</think>.
+// Both out_reasoning and out_content are malloc'd; caller frees.
+// If no <think> block: out_reasoning = "" (empty malloc), out_content = full text.
+static void extract_think_and_content(const char *gen_response,
+                                       char **out_reasoning, char **out_content) {
+    const char *think_start = strstr(gen_response, "<think>");
+    const char *think_end   = think_start ? strstr(think_start, "</think>") : NULL;
+
+    if (think_start && think_end) {
+        // reasoning = text between <think> and </think>
+        const char *r_start = think_start + 7;  // skip "<think>"
+        int r_len = (int)(think_end - r_start);
+        if (r_len < 0) r_len = 0;
+        *out_reasoning = malloc(r_len + 1);
+        memcpy(*out_reasoning, r_start, r_len);
+        (*out_reasoning)[r_len] = '\0';
+
+        // content = text after </think> (skip leading newline if present)
+        const char *c_start = think_end + 8;  // skip "</think>"
+        while (*c_start == '\n' || *c_start == '\r') c_start++;
+        // Stop at tool call markers
+        const char *c_end = strstr(c_start, "<tool_call>");
+        const char *c_end2 = strstr(c_start, "{\"tool\":");
+        if (!c_end || (c_end2 && c_end2 < c_end)) c_end = c_end2;
+        if (!c_end) c_end = c_start + strlen(c_start);
+        int c_len = (int)(c_end - c_start);
+        // Trim trailing whitespace
+        while (c_len > 0 && (c_start[c_len-1] == ' '  ||
+                              c_start[c_len-1] == '\n' ||
+                              c_start[c_len-1] == '\r')) c_len--;
+        *out_content = malloc(c_len + 1);
+        memcpy(*out_content, c_start, c_len);
+        (*out_content)[c_len] = '\0';
+    } else {
+        *out_reasoning = strdup("");
+        // content = full text up to tool call markers
+        const char *c_end = strstr(gen_response, "<tool_call>");
+        const char *c_end2 = strstr(gen_response, "{\"tool\":");
+        if (!c_end || (c_end2 && c_end2 < c_end)) c_end = c_end2;
+        if (!c_end) c_end = gen_response + strlen(gen_response);
+        int c_len = (int)(c_end - gen_response);
+        while (c_len > 0 && (gen_response[c_len-1] == ' '  ||
+                              gen_response[c_len-1] == '\n' ||
+                              gen_response[c_len-1] == '\r')) c_len--;
+        *out_content = malloc(c_len + 1);
+        memcpy(*out_content, gen_response, c_len);
+        (*out_content)[c_len] = '\0';
+    }
+}
+
+// Parse a tool call from generated model output.
+// Handles three formats:
+//   Format 1: <tool_call>{"name":"...","arguments":{...}}</tool_call>
+//   Format 2: <tool_call><function=NAME>...</function></tool_call>
+//   Format 3: {"tool":"...","arguments":{...}}  (flat JSON, new Chinese prompt format)
+// *pre_len: length of content BEFORE the tool call marker
+// name_out: buffer for function name (null-terminated)
+// *arguments_out: malloc'd raw JSON string for arguments — caller must free()
+// Returns 1 if found and parsed, 0 otherwise.
+// Extract a JSON object starting at *p, bounded by end. Advances *p past the object.
+// Returns malloc'd copy or NULL. Caller frees.
+static char *extract_json_object(const char **p, const char *end) {
+    if (**p != '{') return NULL;
+    const char *start = *p;
+    int depth = 0, in_str = 0;
+    while (*p < end) {
+        char c = **p;
+        if (in_str) {
+            if (c == '\\') { (*p)++; }  // skip escaped char
+            else if (c == '"') in_str = 0;
+        } else {
+            if (c == '"') in_str = 1;
+            else if (c == '{') depth++;
+            else if (c == '}') { if (--depth == 0) { (*p)++; break; } }
+        }
+        (*p)++;
+    }
+    int len = (int)(*p - start);
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+// Extract a JSON string value after a key. p points just after the ':'.
+// Returns malloc'd unescaped string or NULL. Caller frees.
+static char *extract_json_string(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n')) p++;
+    if (*p != '"') return NULL;
+    p++;
+    char *buf = malloc((size_t)(end - p) + 1);
+    if (!buf) return NULL;
+    int i = 0;
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            switch (*p) {
+                case '"':  buf[i++] = '"';  break;
+                case '\\': buf[i++] = '\\'; break;
+                case 'n':  buf[i++] = '\n'; break;
+                case 'r':  buf[i++] = '\r'; break;
+                case 't':  buf[i++] = '\t'; break;
+                default:   buf[i++] = '\\'; buf[i++] = *p; break;
+            }
+        } else {
+            buf[i++] = *p;
+        }
+        p++;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+static int parse_tool_call(const char *gen_response, int *pre_len,
+                            char *name_out, int name_max,
+                            char **arguments_out, int *arguments_len_out) {
+    const char *end = gen_response + strlen(gen_response);
+
+    // ---- Format 1: {"tool": "name", "arguments": {...}} ----
+    // New Chinese prompt format — flat JSON object, no wrapper tags.
+    const char *flat = strstr(gen_response, "\"tool\"");
+    if (flat) {
+        // Walk back to the opening '{' of the object
+        const char *obj_start = flat;
+        while (obj_start > gen_response && *obj_start != '{') obj_start--;
+        if (*obj_start == '{') {
+            const char *p = obj_start;
+            char *obj = extract_json_object(&p, end);
+            if (obj) {
+                // Extract "tool" name
+                const char *tp = strstr(obj, "\"tool\"");
+                char *name = NULL;
+                if (tp) {
+                    tp += 6;
+                    while (*tp == ' ' || *tp == ':') tp++;
+                    name = extract_json_string(tp, obj + strlen(obj));
+                }
+                // Extract "arguments" object
+                const char *ap = strstr(obj, "\"arguments\"");
+                char *args = NULL;
+                if (ap) {
+                    ap += 11;
+                    while (*ap == ' ' || *ap == ':') ap++;
+                    const char *ap2 = ap;
+                    args = extract_json_object(&ap2, obj + strlen(obj));
+                }
+                if (name && name[0]) {
+                    int nl = (int)strlen(name);
+                    if (nl >= name_max) nl = name_max - 1;
+                    memcpy(name_out, name, nl);
+                    name_out[nl] = '\0';
+                    *pre_len = (int)(obj_start - gen_response);
+                    *arguments_out = args ? args : strdup("{}");
+                    *arguments_len_out = (int)strlen(*arguments_out);
+                    free(name); free(obj);
+                    return 1;
+                }
+                free(name); free(args); free(obj);
+            }
+        }
+    }
+
+    // ---- Format 2: <tool_call>{"name":"...","arguments":{...}}</tool_call> ----
+    const char *tag_start = strstr(gen_response, "<tool_call>");
+    if (!tag_start) return 0;
+    const char *tag_end = strstr(tag_start, "</tool_call>");
+    if (!tag_end) tag_end = end;
+
+    *pre_len = (int)(tag_start - gen_response);
+
+    const char *body = tag_start + 11;
+    while (*body == ' ' || *body == '\n' || *body == '\r' || *body == '\t' ||
+           *body == '`') body++;  // skip optional ```json fence
+    if (*body != '{') return 0;
+
+    const char *bp = body;
+    char *obj = extract_json_object(&bp, tag_end);
+    if (!obj) return 0;
+
+    // Accept both "tool" and "name" keys for the function name
+    const char *np = strstr(obj, "\"tool\"");
+    if (!np) np = strstr(obj, "\"name\"");
+    char *name = NULL;
+    if (np) { np += (strncmp(np, "\"tool\"", 6) == 0 ? 6 : 6); while (*np == ' ' || *np == ':') np++; name = extract_json_string(np, obj + strlen(obj)); }
+    const char *ap = strstr(obj, "\"arguments\"");
+    char *args = NULL;
+    if (ap) { ap += 11; while (*ap == ' ' || *ap == ':') ap++; const char *ap2 = ap; args = extract_json_object(&ap2, obj + strlen(obj)); }
+
+    free(obj);
+    if (!name || !name[0]) { free(name); free(args); return 0; }
+
+    int nl = (int)strlen(name);
+    if (nl >= name_max) nl = name_max - 1;
+    memcpy(name_out, name, nl);
+    name_out[nl] = '\0';
+    *arguments_out = args ? args : strdup("{}");
+    *arguments_len_out = (int)strlen(*arguments_out);
+    free(name);
+    return 1;
 }
 
 // Save a conversation turn to ~/.flash-moe/sessions/<session_id>.jsonl
@@ -5834,6 +6576,27 @@ static void sse_send_done(int fd, const char *request_id) {
     http_write(fd, chunk, n);
 }
 
+// Send a structured tool_calls SSE event and [DONE] (streaming mode).
+// esc_args: already JSON-string-escaped arguments (e.g. "{\"location\":\"杭州\"}")
+static void sse_send_tool_call_done(int fd, const char *request_id,
+                                     const char *call_id,
+                                     const char *fn_name,
+                                     const char *esc_args) {
+    size_t buf_size = strlen(fn_name) + strlen(esc_args) + strlen(call_id) + 512;
+    char *chunk = malloc(buf_size);
+    if (!chunk) return;
+    int n = snprintf(chunk, buf_size,
+        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+        "\"choices\":[{\"index\":0,\"delta\":{"
+        "\"tool_calls\":[{\"id\":\"%s\",\"type\":\"function\",\"index\":0,"
+        "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n",
+        request_id, call_id, fn_name, esc_args);
+    http_write(fd, chunk, n);
+    free(chunk);
+}
+
 static const char *SSE_HEADERS =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/event-stream\r\n"
@@ -5883,6 +6646,175 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     return pt;
 }
 
+// Build a compact tools description string from the OpenAI tools JSON array.
+// Extracts name + description for each tool and formats as a readable list.
+// Returns a malloc'd string; caller frees. Falls back to raw JSON on parse error.
+// Extract a simple JSON string value for a key within [start, end).
+// Returns malloc'd string or NULL. Caller frees.
+static char *json_get_string(const char *key, const char *start, const char *end) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(start, search);
+    if (!p || p >= end) return NULL;
+    p += strlen(search);
+    while (p < end && (*p == ' ' || *p == ':')) p++;
+    if (p >= end || *p != '"') return NULL;
+    return extract_json_string(p, end);
+}
+
+// Build tool description string for system prompt: name, description, and parameters.
+// Format per tool:
+//   工具名: get_weather
+//   描述: 获取指定城市的天气信息
+//   参数:
+//     - location (string, 必填): 城市名称，例如：北京、上海
+// Returns malloc'd string; caller frees.
+static char *build_tools_description(const char *tools_json, int tools_len) {
+    char *out = malloc((size_t)tools_len * 4 + 1024);
+    if (!out) return NULL;
+    char *wp = out;
+    const char *p = tools_json;
+    const char *end = tools_json + tools_len;
+    int first = 1;
+
+    while (p < end) {
+        // Find "function": { ... }
+        const char *fn_key = strstr(p, "\"function\"");
+        if (!fn_key || fn_key >= end) break;
+        const char *fn_obj_start = fn_key + 10;
+        while (*fn_obj_start == ' ' || *fn_obj_start == ':') fn_obj_start++;
+        if (*fn_obj_start != '{') { p = fn_key + 10; continue; }
+
+        // Walk to end of this function object
+        const char *fn_p = fn_obj_start;
+        char *fn_obj = extract_json_object(&fn_p, end);
+        if (!fn_obj) { p = fn_obj_start + 1; continue; }
+        const char *fo_end = fn_obj + strlen(fn_obj);
+
+        char *name = json_get_string("name", fn_obj, fo_end);
+        char *desc = json_get_string("description", fn_obj, fo_end);
+
+        if (!first) wp += sprintf(wp, "\n");
+        first = 0;
+
+        wp += sprintf(wp, "工具名: %s\n描述: %s\n参数:\n",
+                      name ? name : "(unknown)", desc ? desc : "");
+
+        // Parse parameters.properties
+        const char *params_key = strstr(fn_obj, "\"parameters\"");
+        if (params_key) {
+            params_key += 12;
+            while (*params_key == ' ' || *params_key == ':') params_key++;
+            if (*params_key == '{') {
+                const char *params_p = params_key;
+                char *params_obj = extract_json_object(&params_p, fo_end);
+                if (params_obj) {
+                    // Extract required array
+                    char required_buf[1024] = {0};
+                    const char *req_p = strstr(params_obj, "\"required\"");
+                    if (req_p) {
+                        req_p += 10;
+                        while (*req_p == ' ' || *req_p == ':') req_p++;
+                        if (*req_p == '[') {
+                            req_p++;
+                            int ri = 0;
+                            while (*req_p && *req_p != ']' && ri < 1020) {
+                                required_buf[ri++] = *req_p++;
+                            }
+                            required_buf[ri] = '\0';
+                        }
+                    }
+
+                    // Find properties object
+                    const char *props_p = strstr(params_obj, "\"properties\"");
+                    if (props_p) {
+                        props_p += 12;
+                        while (*props_p == ' ' || *props_p == ':') props_p++;
+                        if (*props_p == '{') {
+                            const char *pp = props_p + 1;  // skip '{'
+                            // Iterate over each property key: "propname": {...}
+                            while (*pp && *pp != '}') {
+                                while (*pp == ' ' || *pp == '\n' || *pp == '\r' || *pp == ',') pp++;
+                                if (*pp != '"') break;
+                                // Extract property name
+                                pp++;
+                                char prop_name[128] = {0};
+                                int pni = 0;
+                                while (*pp && *pp != '"' && pni < 127) prop_name[pni++] = *pp++;
+                                prop_name[pni] = '\0';
+                                if (*pp == '"') pp++;
+                                while (*pp == ' ' || *pp == ':') pp++;
+                                if (*pp != '{') break;
+
+                                // Extract the property object
+                                const char *prop_p = pp;
+                                char *prop_obj = extract_json_object(&prop_p, params_obj + strlen(params_obj));
+                                if (!prop_obj) break;
+
+                                char *ptype = json_get_string("type", prop_obj, prop_obj + strlen(prop_obj));
+                                char *pdesc = json_get_string("description", prop_obj, prop_obj + strlen(prop_obj));
+
+                                // Check if required
+                                char search_req[130];
+                                snprintf(search_req, sizeof(search_req), "\"%s\"", prop_name);
+                                int is_req = strstr(required_buf, search_req) != NULL;
+
+                                wp += sprintf(wp, "  - %s (%s%s): %s\n",
+                                              prop_name,
+                                              ptype ? ptype : "any",
+                                              is_req ? ", 必填" : "",
+                                              pdesc ? pdesc : "");
+
+                                free(ptype); free(pdesc); free(prop_obj);
+                                pp = prop_p;
+                            }
+                        }
+                    }
+                    free(params_obj);
+                }
+            }
+        }
+
+        free(name); free(desc); free(fn_obj);
+        p = fn_p;
+    }
+    *wp = '\0';
+
+    // Fall back to raw JSON if nothing was extracted
+    if (wp == out) {
+        memcpy(out, tools_json, (size_t)tools_len);
+        out[tools_len] = '\0';
+    }
+    return out;
+}
+
+// Build a malloc'd system prompt string with Chinese tool instructions appended.
+// Caller must free() the result.
+static char *build_system_prompt_with_tools(const char *base_sys,
+                                             const char *tools_json, int tools_len) {
+    char *tools_desc = build_tools_description(tools_json, tools_len);
+    if (!tools_desc) return NULL;
+
+    // Chinese tool prompt: clear format, no XML, just JSON output
+    static const char *PREFIX =
+        "\n\n你是一个可以调用外部工具的助手。当需要获取实时信息或执行特定操作时，"
+        "请输出一个 JSON 对象表示要调用的工具。\n"
+        "可用的工具如下：\n";
+    static const char *SUFFIX =
+        "\n输出格式必须严格为：{\"tool\": \"工具名称\", \"arguments\": {参数对象}}。\n"
+        "**重要提示：请判断用户的问题，是否需要调用工具，如果需要调用工具，"
+        "聪明的选择对应的工具，并使用以上格式输出。注意不要重复本格式说明。**\n"
+        "如果不需要调用工具，请直接给出普通回答。";
+
+    size_t total = strlen(base_sys) + strlen(PREFIX) + strlen(tools_desc) + strlen(SUFFIX) + 4;
+    char *buf = malloc(total);
+    if (!buf) { free(tools_desc); return NULL; }
+    snprintf(buf, total, "%s%s%s%s", base_sys, PREFIX, tools_desc, SUFFIX);
+    free(tools_desc);
+    fprintf(stderr, "[serve] System prompt with tools (%zu bytes):\n%s\n", strlen(buf), buf);
+    return buf;
+}
+
 // Load custom system prompt from ~/.flash-moe/system.md, or use default
 static char *load_system_prompt(void) {
     const char *home = getenv("HOME");
@@ -5903,6 +6835,258 @@ static char *load_system_prompt(void) {
         }
     }
     return strdup("You are a helpful assistant. /think");
+}
+
+// Detect if any message in the messages array has role:"tool" (tool result turn).
+static int has_tool_result_message(const char *body) {
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == '"') { p++; if (strncmp(p, "tool\"", 5) == 0) return 1; }
+    }
+    return 0;
+}
+
+// Detect if any message has role:"assistant" (prior assistant turn in conversation).
+static int has_prior_assistant_message(const char *body) {
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == '"') { p++; if (strncmp(p, "assistant\"", 10) == 0) return 1; }
+    }
+    return 0;
+}
+
+// Detect if any message has role:"user".
+static int has_user_message(const char *body) {
+    const char *p = body;
+    while ((p = strstr(p, "\"role\"")) != NULL) {
+        p += 6;
+        while (*p == ' ' || *p == ':' || *p == '\t') p++;
+        if (*p == '"') { p++; if (strncmp(p, "user\"", 5) == 0) return 1; }
+    }
+    return 0;
+}
+
+// Extract the content of the first role:"system" message from the request body.
+// Returns malloc'd unescaped string; caller frees. NULL if not found.
+static char *extract_system_content(const char *body) {
+    const char *p = body;
+    // Find "messages" array
+    p = strstr(p, "\"messages\"");
+    if (!p) return NULL;
+    p = strchr(p, '[');
+    if (!p) return NULL;
+    const char *body_end = body + strlen(body);
+    p++; // skip '['
+
+    while (p < body_end) {
+        while (p < body_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+        // Find the matching closing brace for this message object
+        const char *obj_start = p;
+        int depth = 0, in_str = 0;
+        while (p < body_end) {
+            if (in_str) {
+                if (*p == '\\') { p++; if (p < body_end) p++; continue; }
+                if (*p == '"') in_str = 0;
+            } else {
+                if (*p == '"') in_str = 1;
+                else if (*p == '{' || *p == '[') depth++;
+                else if (*p == '}' || *p == ']') { if (--depth == 0) { p++; break; } }
+            }
+            p++;
+        }
+        // Check if this message has role:"system"
+        const char *role_p = strstr(obj_start, "\"role\"");
+        if (!role_p || role_p >= p) continue;
+        const char *rv = role_p + 6;
+        while (*rv == ' ' || *rv == ':' || *rv == '\t') rv++;
+        if (*rv != '"') continue;
+        rv++;
+        if (strncmp(rv, "system\"", 7) != 0) continue;
+        // Found system message — extract content
+        const char *cp = strstr(obj_start, "\"content\"");
+        if (!cp || cp >= p) continue;
+        cp += 9;
+        while (*cp == ' ' || *cp == ':' || *cp == '\t') cp++;
+        if (*cp != '"') continue;
+        cp++; // skip opening quote
+        // Find end of string (handle escapes)
+        const char *end = cp;
+        while (end < p && !(*end == '"' && *(end-1) != '\\')) end++;
+        size_t len = (size_t)(end - cp);
+        char *result = malloc(len + 1);
+        if (!result) return NULL;
+        // Unescape inline
+        char *w = result;
+        const char *r = cp;
+        while (r < end) {
+            if (*r == '\\' && r + 1 < end) {
+                r++;
+                switch (*r) {
+                    case 'n':  *w++ = '\n'; r++; break;
+                    case 't':  *w++ = '\t'; r++; break;
+                    case '"':  *w++ = '"';  r++; break;
+                    case '\\': *w++ = '\\'; r++; break;
+                    default:   *w++ = '\\'; *w++ = *r++; break;
+                }
+            } else {
+                *w++ = *r++;
+            }
+        }
+        *w = '\0';
+        return result;
+    }
+    return NULL;
+}
+
+// Dynamic string builder helper — appends s (slen bytes, or strlen if -1) to *buf.
+// Grows *buf via realloc. Returns 1 on success, 0 on alloc failure.
+static int sb_append(char **buf, size_t *len, size_t *cap, const char *s, int slen) {
+    if (slen < 0) slen = (int)strlen(s);
+    if (*len + (size_t)slen + 1 >= *cap) {
+        size_t new_cap = (*len + (size_t)slen + 1024) * 2;
+        char *nb = realloc(*buf, new_cap);
+        if (!nb) return 0;
+        *buf = nb; *cap = new_cap;
+    }
+    memcpy(*buf + *len, s, (size_t)slen);
+    *len += (size_t)slen;
+    (*buf)[*len] = '\0';
+    return 1;
+}
+
+// Build a full multi-turn Qwen3.5 chat template prompt from the messages array.
+// Handles role:user, role:assistant (with or without tool_calls), role:tool.
+// sys_prompt: already-assembled system prompt (may include tool descriptions).
+// Returns malloc'd prompt string; caller frees. NULL on error.
+// Extract the content of the last role:"assistant" message from the messages array.
+// Does not mutate body. Returns malloc'd unescaped string; caller frees.
+static char *extract_last_assistant_content_from_messages(const char *body) {
+    const char *p = strstr(body, "\"messages\"");
+    if (!p) return NULL;
+    p = strchr(p, ':');
+    if (!p) return NULL;
+    while (*p == ':' || *p == ' ' || *p == '\t') p++;
+    if (*p != '[') return NULL;
+    p++;
+    const char *body_end = body + strlen(body);
+    char *last = NULL;
+    while (p < body_end) {
+        while (p < body_end && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p==',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+        const char *pp = p;
+        char *obj = extract_json_object(&pp, body_end);
+        if (!obj) break;
+        p = pp;
+        const char *obj_end = obj + strlen(obj);
+        char *role = json_get_string("role", obj, obj_end);
+        if (role && strcmp(role, "assistant") == 0) {
+            if (last) free(last);
+            last = json_get_string("content", obj, obj_end);
+        }
+        if (role) free(role);
+        free(obj);
+    }
+    return last;
+}
+
+static char *build_multiturn_prompt(const char *body, const char *sys_prompt) {
+#define SB(s) do { if (!sb_append(&buf, &len, &cap, (s), -1)) { free(buf); return NULL; } } while(0)
+    size_t cap = strlen(sys_prompt) + 8192;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+    size_t len = 0;
+
+    SB("<|im_start|>system\n"); SB(sys_prompt); SB("<|im_end|>\n");
+
+    const char *p = strstr(body, "\"messages\"");
+    if (!p) goto done;
+    p = strchr(p, ':');
+    if (!p) goto done;
+    while (*p == ':' || *p == ' ' || *p == '\t') p++;
+    if (*p != '[') goto done;
+    p++; // skip '['
+    const char *body_end = body + strlen(body);
+
+    while (p < body_end) {
+        while (p < body_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (*p == ']') break;
+        if (*p != '{') break;
+
+        const char *pp = p;
+        char *obj = extract_json_object(&pp, body_end);
+        if (!obj) break;
+        p = pp;
+
+        const char *obj_end = obj + strlen(obj);
+        char *role = json_get_string("role", obj, obj_end);
+        if (!role) { free(obj); continue; }
+
+        if (strcmp(role, "system") == 0) {
+            // Skip — we use our own (tool-augmented) system prompt.
+        } else if (strcmp(role, "user") == 0) {
+            char *content = json_get_string("content", obj, obj_end);
+            if (content) {
+                SB("<|im_start|>user\n"); SB(content); SB("<|im_end|>\n");
+                free(content);
+            }
+        } else if (strcmp(role, "assistant") == 0) {
+            SB("<|im_start|>assistant\n");
+            const char *tc_key = strstr(obj, "\"tool_calls\"");
+            if (tc_key && tc_key < obj_end) {
+                // Reconstruct tool call in our flat JSON format
+                char *fn_name = json_get_string("name", tc_key, obj_end);
+                char *fn_args = json_get_string("arguments", tc_key, obj_end);
+                if (fn_name && fn_args) {
+                    SB("{\"tool\": \""); SB(fn_name);
+                    SB("\", \"arguments\": "); SB(fn_args); SB("}");
+                }
+                if (fn_name) free(fn_name);
+                if (fn_args) free(fn_args);
+            } else {
+                char *content = json_get_string("content", obj, obj_end);
+                if (content) { SB(content); free(content); }
+            }
+            SB("<|im_end|>\n");
+        } else if (strcmp(role, "tool") == 0) {
+            char *content = json_get_string("content", obj, obj_end);
+            if (content) {
+                SB("<|im_start|>tool\n"); SB(content); SB("\n<|im_end|>\n");
+                free(content);
+            }
+        }
+        free(role);
+        free(obj);
+    }
+
+done:
+    SB("<|im_start|>assistant\n");
+#undef SB
+    return buf;
+}
+
+// Tokenize a full chat message using an explicit system prompt (for tool requests).
+// sys_with_tools: caller-owned string including tool definitions; not freed here.
+static PromptTokens *tokenize_chat_message_with_tools(const char *user_content,
+                                                       const char *sys_with_tools) {
+    size_t total = 30 + strlen(sys_with_tools) + 30 + strlen(user_content) + 40;
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total,
+        "<|im_start|>system\n%s<|im_end|>\n"
+        "<|im_start|>user\n%s<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        sys_with_tools, user_content);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
@@ -5998,7 +7182,7 @@ static void serve_loop(
     static uint64_t req_counter = 0;
 
     // ---- System prompt cache: prefill system prompt once at startup ----
-    // Tokenize the system prompt and run it through all 60 layers.
+    // Tokenize the system prompt and run it through all 48 layers.
     // Save the resulting KV cache + linear attention state as a snapshot.
     // On each request, restore the snapshot instead of re-prefilling.
     fprintf(stderr, "[serve] Pre-caching system prompt...\n");
@@ -6107,12 +7291,12 @@ static void serve_loop(
     if (g_metal && g_metal->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
             if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
+                size_t sz = DELTA_STATE_SIZE*sizeof(float);
                 gpu_delta_snapshots[i] = malloc(sz);
                 memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
             }
             if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
+                size_t sz = (3*LINEAR_CONV_DIM)*sizeof(float);
                 gpu_conv_snapshots[i] = malloc(sz);
                 memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
             }
@@ -6125,6 +7309,7 @@ static void serve_loop(
     // We just track whether to restore from snapshot (new session) or continue (same session).
     char active_session_id[64] = {0};
     int session_pos = 0;  // RoPE position after last generation for the active session
+    char *g_last_assistant_content = NULL;  // last gen_response for auto-continuation detection
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6156,7 +7341,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\"}\n";
+                "{\"status\":\"ok\",\"model\":\"qwen3.5-122b-a10b\"}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
             continue;
@@ -6170,7 +7355,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\","
+                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-122b-a10b\","
                 "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
@@ -6189,60 +7374,286 @@ static void serve_loop(
             }
             body += 4;
 
-            // Extract session_id and max_tokens BEFORE content extraction
-            // (extract_last_content mutates the body buffer in place)
+            if (g_debug_level > 1) {
+                // Log full request for debugging
+                int body_len = (int)strlen(body);
+                fprintf(stderr, "\n[serve] === NEW REQUEST (%d bytes) ===\n", body_len);
+                if (body_len <= 200000) {
+                    fprintf(stderr, "%s\n", body);
+                } else {
+                    fprintf(stderr, "%.1000s\n...(%d bytes omitted)...\n%.500s\n",
+                            body, body_len - 1500, body + body_len - 500);
+                }
+            }
+            fprintf(stderr, "[serve] has_user_message=%d\n", has_user_message(body));
+
+            // Reject requests with no user message (e.g. system-prompt-only warmup)
+            if (!has_user_message(body)) {
+                fprintf(stderr, "[serve] no user message — returning empty response\n");
+                // Detect stream preference
+                int warmup_stream = 1;
+                const char *ws_p = strstr(body, "\"stream\"");
+                if (ws_p) {
+                    ws_p += 8;
+                    while (*ws_p == ' ' || *ws_p == '\t' || *ws_p == ':') ws_p++;
+                    if (strncmp(ws_p, "false", 5) == 0) warmup_stream = 0;
+                }
+                char warmup_id[64];
+                snprintf(warmup_id, sizeof(warmup_id), "chatcmpl-%llu", ++req_counter);
+                if (warmup_stream) {
+                    http_write_str(client_fd, SSE_HEADERS);
+                    char chunk[512];
+                    int n = snprintf(chunk, sizeof(chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+                        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n", warmup_id);
+                    http_write(client_fd, chunk, n);
+                } else {
+                    char resp[512];
+                    int n = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],"
+                        "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n",
+                        warmup_id);
+                    http_write(client_fd, resp, n);
+                }
+                free(reqbuf); close(client_fd); continue;
+            }
+
+            // Extract stream flag (default true for SSE compatibility)
+            int do_stream = 1;
+            const char *stream_p = strstr(body, "\"stream\"");
+            if (stream_p) {
+                stream_p += 8;
+                while (*stream_p == ' ' || *stream_p == '\t' || *stream_p == ':') stream_p++;
+                if (strncmp(stream_p, "false", 5) == 0) do_stream = 0;
+            }
+
+            // Extract session_id, max_tokens, and tools BEFORE content extraction
+            // (extract_last_content mutates the body buffer in place — must be last)
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
+            // Per-request temperature (overrides global --temp if present)
+            float req_temperature = g_temperature;
+            {
+                const char *tp = strstr(body, "\"temperature\"");
+                if (tp) {
+                    tp = strchr(tp, ':');
+                    if (tp) req_temperature = strtof(tp + 1, NULL);
+                }
+            }
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
-            // Extract user content from messages (mutates body — must be last)
-            char *content = extract_last_content(body);
-            if (!content || strlen(content) == 0) {
-                http_write_str(client_fd,
-                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
-                    "{\"error\":\"no content in messages\"}\n");
-                free(reqbuf); close(client_fd); continue;
+            // Extract tools array (pointer into body — non-mutating)
+            const char *tools_json_start = NULL;
+            int tools_json_len = 0;
+            int has_tools = extract_tools_json(body, &tools_json_start, &tools_json_len);
+            // Respect tool_choice: "none"
+            {
+                const char *tc_p = strstr(body, "\"tool_choice\"");
+                if (tc_p) {
+                    tc_p = strchr(tc_p, ':');
+                    if (tc_p) {
+                        while (*tc_p == ':' || *tc_p == ' ' || *tc_p == '\t') tc_p++;
+                        if (strncmp(tc_p, "\"none\"", 6) == 0) has_tools = 0;
+                    }
+                }
             }
+            // is_continuation only needs session IDs — compute before body mutation
             int is_continuation = (has_session &&
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
+
+            // Extract system prompt from request BEFORE body mutation
+            char *req_system_prompt = extract_system_content(body);
+
+            // Detect multi-turn BEFORE extract_last_content mutates body.
+            // need_multiturn: messages has prior history we must replay into the prompt.
+            int is_tool_result  = has_tool_result_message(body);
+            int has_prior_turns = !is_continuation && has_prior_assistant_message(body);
+
+            // Auto-continuation: if the last assistant message matches what we just
+            // generated, the KV cache is already a valid prefix — skip full prefill.
+            int is_auto_continuation = 0;
+            if (has_prior_turns && !is_tool_result && !has_tools
+                    && g_last_assistant_content && session_pos > 0) {
+                char *last_asst = extract_last_assistant_content_from_messages(body);
+                if (last_asst) {
+                    is_auto_continuation = (strcmp(last_asst, g_last_assistant_content) == 0);
+                    free(last_asst);
+                }
+            }
+            if (is_auto_continuation) is_continuation = 1;  // piggyback on continuation path
+            int need_multiturn = is_tool_result || (has_prior_turns && !is_auto_continuation);
+
+            char *tools_sys_prompt = NULL;  // malloc'd per-request; freed after response
+            char *multiturn_prompt_str = NULL;
+            if (need_multiturn) {
+                static char *g_base_sys_mt = NULL;
+                if (!g_base_sys_mt) g_base_sys_mt = load_system_prompt();
+                // Use system prompt from request if available
+                const char *base_sys_mt = (req_system_prompt && strlen(req_system_prompt) > 0) ? req_system_prompt : g_base_sys_mt;
+                const char *the_sys = base_sys_mt;
+                if (has_tools) {
+                    tools_sys_prompt = build_system_prompt_with_tools(
+                        base_sys_mt, tools_json_start, tools_json_len);
+                    if (tools_sys_prompt) the_sys = tools_sys_prompt;
+                }
+                multiturn_prompt_str = build_multiturn_prompt(body, the_sys);
+            }
+
+            // Extract user content from last user message (malloc'd; caller frees)
+            char *content = extract_last_user_content(body);
+            if (!content || strlen(content) == 0) {
+                // No user content — return empty response (Zed warmup/init request)
+                fprintf(stderr, "[serve] no user content in messages — returning empty response\n");
+                int warmup_stream2 = 1;
+                const char *ws2 = strstr(body, "\"stream\"");
+                if (ws2) {
+                    ws2 += 8;
+                    while (*ws2 == ' ' || *ws2 == '\t' || *ws2 == ':') ws2++;
+                    if (strncmp(ws2, "false", 5) == 0) warmup_stream2 = 0;
+                }
+                char warmup_id2[64];
+                snprintf(warmup_id2, sizeof(warmup_id2), "chatcmpl-%llu", ++req_counter);
+                if (warmup_stream2) {
+                    http_write_str(client_fd, SSE_HEADERS);
+                    char chunk[512];
+                    int n = snprintf(chunk, sizeof(chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
+                        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n"
+                        "data: [DONE]\n\n", warmup_id2);
+                    http_write(client_fd, chunk, n);
+                } else {
+                    char resp[512];
+                    int n = snprintf(resp, sizeof(resp),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],"
+                        "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n",
+                        warmup_id2);
+                    http_write(client_fd, resp, n);
+                }
+                if (multiturn_prompt_str) free(multiturn_prompt_str);
+                if (tools_sys_prompt) free(tools_sys_prompt);
+                if (req_system_prompt) free(req_system_prompt);
+                free(reqbuf); close(client_fd); continue;
+            }
 
             // Session persistence is handled by the client (chat.m)
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen,
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, has_tools=%d, is_tool_result=%d, has_prior=%d%s, session=%s%s\n",
+                    request_id, strlen(content), max_gen, has_tools, is_tool_result, has_prior_turns,
+                    is_auto_continuation ? "(auto)" : "",
                     has_session ? req_session_id : "(none)",
                     is_continuation ? " [CONTINUE]" : " [NEW]");
+            fprintf(stderr, "[serve] %s need_multiturn=%d, do_full_prefill=%d, is_continuation=%d\n",
+                    request_id, need_multiturn, has_tools || need_multiturn, is_continuation);
+            fprintf(stderr, "[serve] %s user_content (first 200): %.200s\n", request_id, content);
 
             // ---- Tokenize ----
-            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
-            // New session: just the user turn (system prompt restored from snapshot)
+            // need_multiturn: build full Qwen3.5 chat template from messages array
+            // is_continuation: KV cache has prior turns — append new user turn only
+            // has_tools: single first-turn tool request — inject tools into system prompt
+            // else: fresh single-turn request
+            int do_full_prefill = need_multiturn || has_tools;
             PromptTokens *pt;
-            if (is_continuation) {
+            if (is_continuation && !do_full_prefill) {
+                fprintf(stderr, "[serve] %s tokenize path: CONTINUATION\n", request_id);
                 pt = tokenize_continuation_turn(content);
+            } else if (need_multiturn) {
+                fprintf(stderr, "[serve] %s tokenize path: MULTITURN (prompt len=%zu)\n",
+                        request_id, multiturn_prompt_str ? strlen(multiturn_prompt_str) : 0);
+                if (!multiturn_prompt_str) {
+                    http_write_str(client_fd,
+                        "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                        "{\"error\":\"failed to build multiturn prompt\"}\n");
+                    if (tools_sys_prompt) free(tools_sys_prompt);
+                    free(reqbuf); close(client_fd); continue;
+                }
+                pt = encode_prompt_text_to_tokens(multiturn_prompt_str);
+                free(multiturn_prompt_str);
+                multiturn_prompt_str = NULL;
+            } else if (has_tools) {
+                // Single first-turn tool request (no prior assistant turns)
+                // Use system prompt from request if available, fallback to server default
+                fprintf(stderr, "[serve] %s tokenize path: TOOLS (first turn)\n", request_id);
+                static char *g_base_sys = NULL;
+                if (!g_base_sys) g_base_sys = load_system_prompt();
+                const char *base_sys = (req_system_prompt && strlen(req_system_prompt) > 0) ? req_system_prompt : g_base_sys;
+                fprintf(stderr, "[serve] %s system prompt source: %s (%zu chars)\n",
+                        request_id,
+                        (req_system_prompt && strlen(req_system_prompt) > 0) ? "request" : "server-default",
+                        strlen(base_sys));
+                tools_sys_prompt = build_system_prompt_with_tools(
+                    base_sys, tools_json_start, tools_json_len);
+                if (!tools_sys_prompt) {
+                    http_write_str(client_fd,
+                        "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                        "{\"error\":\"failed to build tool system prompt\"}\n");
+                    free(reqbuf); close(client_fd); continue;
+                }
+                pt = tokenize_chat_message_with_tools(content, tools_sys_prompt);
             } else {
+                fprintf(stderr, "[serve] %s tokenize path: PLAIN (user turn only)\n", request_id);
                 pt = tokenize_user_turn(content);
             }
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
+                if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
+                if (req_system_prompt) { free(req_system_prompt); req_system_prompt = NULL; }
+                if (content) { free(content); content = NULL; }
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
-                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
+            fprintf(stderr, "[serve] %s prompt=%d tokens%s%s\n", request_id, pt->count,
+                    is_continuation ? " (continuation)" : "",
+                    do_full_prefill ? " (full-prefill)" : "");
 
             int pos;
-            if (is_continuation) {
+            if (is_continuation && !do_full_prefill) {
                 // ---- Continue from existing session state ----
                 // The KV caches + linear attention state already contain the full
                 // conversation history. Just set pos to where we left off.
                 pos = session_pos;
+            } else if (do_full_prefill) {
+                // ---- Full cold reset for tool requests ----
+                // The system prompt differs (includes tool definitions), so the
+                // cached snapshot is invalid. Reset everything to zero and prefill
+                // from pos=0 with the full system+tools+user prompt.
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (kv_caches[i]) kv_caches[i]->len = 0;
+                    if (layer_states[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memset(s->conv_state, 0, conv_state_size);
+                        memset(s->ssm_state, 0, ssm_state_size);
+                    }
+                }
+                if (g_metal && g_metal->delta_net_step) {
+                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+                        if (g_metal->buf_delta_state[i])
+                            memset([g_metal->buf_delta_state[i] contents], 0,
+                                   DELTA_STATE_SIZE*sizeof(float));
+                        if (g_metal->buf_conv_state[i])
+                            memset([g_metal->buf_conv_state[i] contents], 0,
+                                   (3*LINEAR_CONV_DIM)*sizeof(float));
+                    }
+                } else {
+                    reset_delta_net_state();
+                }
+                pos = 0;
+                active_session_id[0] = '\0';  // tool requests are stateless
             } else {
                 // ---- Restore state from system prompt snapshot ----
                 // Instead of resetting to zero, restore to the cached system prompt state.
@@ -6281,10 +7692,10 @@ static void serve_loop(
                     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
                         if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
                             memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
+                                   gpu_delta_snapshots[i], DELTA_STATE_SIZE*sizeof(float));
                         if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
                             memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
+                                   gpu_conv_snapshots[i], (3*LINEAR_CONV_DIM)*sizeof(float));
                     }
                 } else {
                     reset_delta_net_state();
@@ -6299,9 +7710,13 @@ static void serve_loop(
                 }
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
+            float saved_temperature = g_temperature;
+            g_temperature = req_temperature;
 
-            // ---- Send SSE headers ----
-            http_write_str(client_fd, SSE_HEADERS);
+            // ---- Send SSE headers (streaming) or defer (non-streaming) ----
+            if (do_stream) {
+                http_write_str(client_fd, SSE_HEADERS);
+            }
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
@@ -6368,7 +7783,7 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            int next_token = cpu_argmax(logits, VOCAB_SIZE);
+            int next_token = sample_next_token(logits, VOCAB_SIZE);
 
             // ---- Auto-regressive generation with SSE streaming ----
             if (g_pred_enabled) {
@@ -6379,7 +7794,8 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
-            // Accumulate response for session persistence
+            int tool_call_started = 0;  // set once <tool_call> appears; suppresses SSE stream
+            // Accumulate response for session persistence and non-streaming mode
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
@@ -6414,16 +7830,35 @@ static void serve_loop(
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
-                // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                // Always accumulate (used for non-streaming response + session persistence)
+                if (tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);
                     memcpy(gen_response + gen_resp_len, tok_str, tlen);
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+                if (do_stream) {
+                    if (has_tools) {
+                        if (!tool_call_started) {
+                            // Detect start of tool call block in accumulated output
+                            if (strstr(gen_response, "<tool_call>") ||
+                                strstr(gen_response, "\"tool\"")) {
+                                tool_call_started = 1;
+                                // Suppress this and all subsequent tokens
+                            } else {
+                                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                                    fprintf(stderr, "[serve] %s client disconnected\n", request_id);
+                                    break;
+                                }
+                            }
+                        }
+                        // Once tool_call_started: accumulate silently, emit structured event later
+                    } else {
+                        if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                            fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                            break;
+                        }
+                    }
                 }
                 gen_count++;
 
@@ -6449,12 +7884,170 @@ static void serve_loop(
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
-                next_token = cpu_argmax(logits, VOCAB_SIZE);
+                next_token = sample_next_token(logits, VOCAB_SIZE);
             }
 
-            sse_send_done(client_fd, request_id);
+            // ---- JSON-escape helper (used by both streaming and non-streaming paths) ----
+            // Returns malloc'd string; caller frees.
+            #define JSON_ESCAPE(src, srclen, dst, dstlen_out) do { \
+                size_t _sl = (srclen) > 0 ? (srclen) : strlen(src); \
+                (dst) = malloc(_sl * 2 + 1); \
+                char *_w = (dst); \
+                for (size_t _i = 0; _i < _sl; _i++) { \
+                    char _c = (src)[_i]; \
+                    switch (_c) { \
+                        case '"':  *_w++='\\'; *_w++='"';  break; \
+                        case '\\': *_w++='\\'; *_w++='\\'; break; \
+                        case '\n': *_w++='\\'; *_w++='n';  break; \
+                        case '\r': *_w++='\\'; *_w++='r';  break; \
+                        case '\t': *_w++='\\'; *_w++='t';  break; \
+                        default:   *_w++=_c; break; \
+                    } \
+                } \
+                *_w = '\0'; \
+                (dstlen_out) = (int)(_w - (dst)); \
+            } while(0)
+
+            if (do_stream) {
+                if (has_tools && tool_call_started) {
+                    // Parse tool call from accumulated output and emit structured SSE event
+                    int pre_len = 0;
+                    char tc_name[256] = {0};
+                    char *tc_args = NULL;
+                    int tc_args_len = 0;
+                    if (parse_tool_call(gen_response, &pre_len,
+                                        tc_name, sizeof(tc_name),
+                                        &tc_args, &tc_args_len)) {
+                        char call_id[32];
+                        snprintf(call_id, sizeof(call_id), "call_%04llu", req_counter);
+                        char *esc_args = NULL; int esc_args_len = 0;
+                        JSON_ESCAPE(tc_args, tc_args_len, esc_args, esc_args_len);
+                        char *esc_name = NULL; int esc_name_len = 0;
+                        JSON_ESCAPE(tc_name, 0, esc_name, esc_name_len);
+                        (void)esc_args_len; (void)esc_name_len;
+                        sse_send_tool_call_done(client_fd, request_id,
+                                                call_id, esc_name, esc_args);
+                        free(esc_args);
+                        free(esc_name);
+                        free(tc_args);
+                    } else {
+                        sse_send_done(client_fd, request_id);
+                    }
+                } else {
+                    sse_send_done(client_fd, request_id);
+                }
+            } else {
+                // Non-streaming: detect tool call and format response accordingly
+                fprintf(stderr, "[serve] %s gen_response (%d chars): %.500s\n",
+                        request_id, gen_resp_len, gen_response);
+                int pre_len = 0;
+                char tc_name[256] = {0};
+                char *tc_args = NULL;
+                int tc_args_len = 0;
+                int found_tc = has_tools && parse_tool_call(gen_response, &pre_len,
+                                                             tc_name, sizeof(tc_name),
+                                                             &tc_args, &tc_args_len);
+                fprintf(stderr, "[serve] %s found_tc=%d tc_name='%s' tc_args=%s\n",
+                        request_id, found_tc, tc_name, tc_args ? tc_args : "(null)");
+                if (found_tc) {
+                    // Split gen_response into reasoning_content + content
+                    char *reasoning = NULL, *visible_content = NULL;
+                    extract_think_and_content(gen_response, &reasoning, &visible_content);
+
+                    char *esc_content = NULL; int esc_content_len = 0;
+                    JSON_ESCAPE(visible_content, 0, esc_content, esc_content_len);
+                    char *esc_reasoning = NULL; int esc_reasoning_len = 0;
+                    JSON_ESCAPE(reasoning, 0, esc_reasoning, esc_reasoning_len);
+                    char *esc_args = NULL; int esc_args_len = 0;
+                    JSON_ESCAPE(tc_args, tc_args_len, esc_args, esc_args_len);
+                    char *esc_name = NULL; int esc_name_len = 0;
+                    JSON_ESCAPE(tc_name, 0, esc_name, esc_name_len);
+                    (void)esc_content_len; (void)esc_reasoning_len;
+                    (void)esc_args_len; (void)esc_name_len;
+                    free(reasoning); free(visible_content);
+
+                    char call_id[32];
+                    snprintf(call_id, sizeof(call_id), "call_%04llu", req_counter);
+
+                    size_t jbuf_sz = strlen(esc_content) + strlen(esc_reasoning)
+                                   + strlen(esc_args) + strlen(esc_name) + 640;
+                    char *json_body = malloc(jbuf_sz);
+                    int json_len = snprintf(json_body, jbuf_sz,
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{"
+                        "\"role\":\"assistant\","
+                        "\"content\":\"%s\","
+                        "\"reasoning_content\":\"%s\","
+                        "\"tool_calls\":[{"
+                        "\"id\":\"%s\","
+                        "\"type\":\"function\","
+                        "\"index\":0,"
+                        "\"function\":{"
+                        "\"name\":\"%s\","
+                        "\"arguments\":\"%s\""
+                        "}}]},"
+                        "\"finish_reason\":\"tool_calls\"}],"
+                        "\"usage\":{\"completion_tokens\":%d}}",
+                        request_id, esc_content, esc_reasoning,
+                        call_id, esc_name, esc_args, gen_count);
+
+                    free(esc_content);
+                    free(esc_reasoning);
+                    free(esc_args);
+                    free(esc_name);
+                    free(tc_args);
+
+                    char hdr[256];
+                    int hdr_len = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %d\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Connection: close\r\n"
+                        "\r\n", json_len);
+                    http_write(client_fd, hdr, hdr_len);
+                    http_write(client_fd, json_body, json_len);
+                    free(json_body);
+                } else {
+                    if (tc_args) free(tc_args);
+                    // Normal non-streaming response
+                    size_t rlen = strlen(gen_response);
+                    char *escaped = NULL; int escaped_len = 0;
+                    JSON_ESCAPE(gen_response, rlen, escaped, escaped_len);
+                    (void)escaped_len;
+
+                    char *json_body = malloc(strlen(escaped) + 512);
+                    int json_len = sprintf(json_body,
+                        "{\"id\":\"%s\",\"object\":\"chat.completion\","
+                        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                        "\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
+                        "\"usage\":{\"completion_tokens\":%d}}",
+                        request_id, escaped, gen_count);
+                    free(escaped);
+
+                    char hdr[256];
+                    int hdr_len = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %d\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Connection: close\r\n"
+                        "\r\n", json_len);
+                    http_write(client_fd, hdr, hdr_len);
+                    http_write(client_fd, json_body, json_len);
+                    free(json_body);
+                }
+            }
 
             // ---- Save session state ----
+            g_temperature = saved_temperature;
+            if (tools_sys_prompt) { free(tools_sys_prompt); tools_sys_prompt = NULL; }
+            if (req_system_prompt) { free(req_system_prompt); req_system_prompt = NULL; }
+            if (content) { free(content); content = NULL; }
+            // Store last generated content for auto-continuation on next stateless request.
+            // Invalidate if the KV cache contains a tool-augmented system prompt (different prefix).
+            if (g_last_assistant_content) { free(g_last_assistant_content); g_last_assistant_content = NULL; }
+            if (!has_tools && !is_tool_result) g_last_assistant_content = strdup(gen_response);
             free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
             // Just record the position so the next request can continue from here.
@@ -6517,12 +8110,15 @@ static void print_usage(const char *prog) {
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --temp T             Sampling temperature (default: 0.0 = greedy argmax)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --debug LEVEL        Set debug level (0=none, 1=basic, 2=verbose)\n");
     printf("  --help               This message\n");
 }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        srand((unsigned)time(NULL));
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
@@ -6557,12 +8153,14 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"temp",          required_argument, 0, 'X'},
             {"help",          no_argument,       0, 'h'},
+            {"debug",         required_argument, 0, 'd'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:X:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6582,6 +8180,7 @@ int main(int argc, char **argv) {
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
+                case 'd': g_debug_level = atoi(optarg); break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
@@ -6590,19 +8189,35 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
+                case 'X': g_temperature = atof(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
         }
 
-        // Build default paths
+        // Build default paths relative to model_path
+        // When --model is set, model_path may be a prepared output directory
+        // containing model_weights.bin, model_weights.json, vocab.bin, etc.
+        // Fall back to the old cwd-based lookups for backward compat.
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
-        // Try to find files relative to the executable
+        g_model_path = model_path;
+
         if (!weights_path) {
+            // First: try model_path/metal_infer/model_weights.bin (dev tree layout)
+            // Then:  try model_path/model_weights.bin (prepared output dir layout)
+            // Then:  fall back to cwd (old behavior for "." model_path)
             snprintf(default_weights, sizeof(default_weights),
-                     "metal_infer/model_weights.bin");
+                     "%s/metal_infer/model_weights.bin", model_path);
+            if (access(default_weights, R_OK) != 0) {
+                snprintf(default_weights, sizeof(default_weights),
+                         "%s/model_weights.bin", model_path);
+            }
+            if (access(default_weights, R_OK) != 0) {
+                snprintf(default_weights, sizeof(default_weights),
+                         "metal_infer/model_weights.bin");
+            }
             if (access(default_weights, R_OK) != 0) {
                 snprintf(default_weights, sizeof(default_weights),
                          "model_weights.bin");
@@ -6611,7 +8226,15 @@ int main(int argc, char **argv) {
         }
         if (!manifest_path) {
             snprintf(default_manifest, sizeof(default_manifest),
-                     "metal_infer/model_weights.json");
+                     "%s/metal_infer/model_weights.json", model_path);
+            if (access(default_manifest, R_OK) != 0) {
+                snprintf(default_manifest, sizeof(default_manifest),
+                         "%s/model_weights.json", model_path);
+            }
+            if (access(default_manifest, R_OK) != 0) {
+                snprintf(default_manifest, sizeof(default_manifest),
+                         "metal_infer/model_weights.json");
+            }
             if (access(default_manifest, R_OK) != 0) {
                 snprintf(default_manifest, sizeof(default_manifest),
                          "model_weights.json");
@@ -6620,12 +8243,46 @@ int main(int argc, char **argv) {
         }
         if (!vocab_path) {
             snprintf(default_vocab, sizeof(default_vocab),
-                     "metal_infer/vocab.bin");
+                     "%s/metal_infer/vocab.bin", model_path);
+            if (access(default_vocab, R_OK) != 0) {
+                snprintf(default_vocab, sizeof(default_vocab),
+                         "%s/vocab.bin", model_path);
+            }
+            if (access(default_vocab, R_OK) != 0) {
+                snprintf(default_vocab, sizeof(default_vocab),
+                         "metal_infer/vocab.bin");
+            }
             if (access(default_vocab, R_OK) != 0) {
                 snprintf(default_vocab, sizeof(default_vocab),
                          "vocab.bin");
             }
             vocab_path = default_vocab;
+        }
+
+        // ---- Load model config from manifest ----
+        config_set_defaults(&CFG);
+        if (load_config_from_json(manifest_path) == 0) {
+            printf("[config] Model config loaded from %s\n", manifest_path);
+        } else {
+            printf("[config] Using default config (397B)\n");
+        }
+        strncpy(CFG.model_path, model_path, sizeof(CFG.model_path) - 1);
+
+        // Validate config against array bounds
+        if (CFG.num_full_attn_layers > MAX_FULL_ATTN_LAYERS) {
+            fprintf(stderr, "ERROR: num_full_attn_layers=%d exceeds MAX=%d\n",
+                    CFG.num_full_attn_layers, MAX_FULL_ATTN_LAYERS);
+            return 1;
+        }
+        if (CFG.num_linear_layers > MAX_LINEAR_LAYERS) {
+            fprintf(stderr, "ERROR: num_linear_layers=%d exceeds MAX=%d\n",
+                    CFG.num_linear_layers, MAX_LINEAR_LAYERS);
+            return 1;
+        }
+        if (CFG.num_experts_per_tok > MAX_K) {
+            fprintf(stderr, "ERROR: num_experts_per_tok=%d exceeds MAX_K=%d\n",
+                    CFG.num_experts_per_tok, MAX_K);
+            return 1;
         }
 
         // ---- Initialize Metal ----
@@ -6648,8 +8305,9 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
-        printf("Model:    %s\n", model_path);
+        printf("=== Flash-MoE Inference Engine ===\n");
+        printf("Model:    %s (hidden=%d layers=%d experts=%d topK=%d)\n",
+               model_path, CFG.hidden_dim, CFG.num_layers, CFG.num_experts, CFG.num_experts_per_tok);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
@@ -6977,7 +8635,7 @@ int main(int argc, char **argv) {
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----
-        int next_token = cpu_argmax(logits, VOCAB_SIZE);
+        int next_token = sample_next_token(logits, VOCAB_SIZE);
         double ttft_ms = now_ms() - t0;
 
         // Debug: show top-5 logits for first token
@@ -7033,7 +8691,7 @@ int main(int argc, char **argv) {
             cache_telemetry_note_token();
             embed_lookup(wf, next_token, hidden);
 
-            // Run 60 layers (fused: 1+K cmd buffers per layer)
+            // Run 48 layers (fused: 1+K cmd buffers per layer)
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
@@ -7059,7 +8717,7 @@ int main(int argc, char **argv) {
             lm_head_forward(wf, hidden, logits);
 
             // Greedy sample
-            next_token = cpu_argmax(logits, VOCAB_SIZE);
+            next_token = sample_next_token(logits, VOCAB_SIZE);
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {

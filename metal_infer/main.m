@@ -77,8 +77,6 @@
 
 #define EXPERT_SIZE      7077888   // Total bytes per expert
 
-// Default model path
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 // ============================================================================
 // Timing helper
@@ -1504,7 +1502,7 @@ int main(int argc, char **argv) {
         int num_active_experts = 4;  // --k flag
         int do_verify = 0;
         int use_fast = 0;
-        const char *model_path = MODEL_PATH;
+        const char *model_path = "";
 
         static struct option long_options[] = {
             {"layer",     required_argument, 0, 'l'},
