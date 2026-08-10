@@ -60,10 +60,12 @@ def decode_bpe_token(token_str, byte_decoder, is_added=False):
 
 
 def main():
-    tok_path = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser(
-        '~/.cache/modelscope/hub/models/mlx-community/Qwen3.5-122B-A10B-4bit/tokenizer.json'
-    )
+    tok_path = sys.argv[1] if len(sys.argv) > 1 else 'tokenizer.json'
     out_path = sys.argv[2] if len(sys.argv) > 2 else 'vocab.bin'
+
+    if not os.path.exists(tok_path):
+        print(f"ERROR: {tok_path} not found (pass tokenizer.json path as the first argument)", file=sys.stderr)
+        sys.exit(1)
 
     with open(tok_path, 'r', encoding='utf-8') as f:
         t = json.load(f)

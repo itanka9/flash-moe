@@ -5,7 +5,11 @@
 
 set -e
 
-EXPERTS_DIR="/Users/m/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46/packed_experts"
+EXPERTS_DIR="${EXPERTS_DIR:-${1:-}}"
+if [ -z "$EXPERTS_DIR" ]; then
+    echo "ERROR: set EXPERTS_DIR (or pass it as arg1) to the packed_experts directory"
+    exit 1
+fi
 SRC="$EXPERTS_DIR/layer_00.bin"
 WORKDIR="/tmp/apfs_compress_test"
 
